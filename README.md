@@ -2,6 +2,8 @@
 
 A comprehensive PowerShell/WPF application for injecting drivers into Windows Image (WIM) files with intelligent boot.wim vs install.wim driver suitability judgment, enterprise-grade security, and Windows 11 Fluent Design UI.
 
+![WIM Driver Studio Main Window](screenshots/main-window.png)
+
 ## Features
 
 ### Driver Target Suitability Judgment
