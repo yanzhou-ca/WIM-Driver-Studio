@@ -18,7 +18,7 @@ A comprehensive PowerShell/WPF application for injecting drivers into Windows Im
 - **Inventory drivers**: List all drivers installed in a mounted WIM image.
 - **Remove drivers**: Safely remove third-party drivers with boot-critical class protection.
 - **Export drivers**: Backup drivers from a mounted image to a folder.
-- **Batch-style or individual processing**: Choose between fast recursive folder injection or per-driver individual injection.
+- **Batch-style or individual processing**: Choose between one DISM operation for the validated scan results or per-driver individual injection.
 
 ### Security
 - Path traversal attack prevention
@@ -27,7 +27,14 @@ A comprehensive PowerShell/WPF application for injecting drivers into Windows Im
 - Symbolic link target validation
 - Sensitive output redaction (passwords, tokens, keys)
 - SHA-256 file integrity hashing
-- Authenticode signature verification (INF, .cat, .sys, .dll)
+- Authenticode verification for signed INF files; catalog-only packages require manual verification
+
+### Reliability and recovery
+- Uses only the trusted `System32\dism.exe` executable with escaped native arguments.
+- Creates application-owned empty mount directories and never deletes arbitrary user-selected directories.
+- Runs long operations asynchronously with cancellation and targeted discard cleanup.
+- Commits only fully successful operations and reports partial failures accurately.
+- Writes a local operation journal and offers targeted recovery after an interruption.
 
 ### UI/UX
 - Windows 11 Fluent Design (rounded corners, shadows, Segoe UI Variable, Segoe MDL2 Assets icons)
@@ -42,7 +49,7 @@ A comprehensive PowerShell/WPF application for injecting drivers into Windows Im
 
 - **OS**: Windows 10/11 (x64 or ARM64)
 - **PowerShell**: 5.1+ (Windows PowerShell)
-- **Privileges**: Administrator
+- **Privileges**: Administrator for WIM operations; non-elevated mode supports browsing and scanning only
 - **DISM**: Available in System32 (included with Windows)
 - **.NET**: .NET Framework 4.7.2+ (WPF)
 
@@ -57,11 +64,11 @@ Start-Process PowerShell -ArgumentList "-File .\WIM_Driver_Studio.ps1" -Verb Run
 
 1. **Select WIM file** — Browse for `boot.wim` or `install.wim`. The tool auto-detects the image type and architecture.
 2. **Select driver folder** — Browse for a folder containing `.inf` driver packages.
-3. **Scan drivers** — Scans the folder recursively. Drivers are partitioned into:
+3. **Scan drivers** — Scans the folder, optionally including subfolders. Drivers are partitioned into:
    - **Recommended** for the selected image type (pre-checked)
    - **Not recommended** (unchecked, with reason — override if needed)
-4. **Configure** — Set mount directory, recursive search, force unsigned options.
-5. **Start** — Mounts each WIM index, injects selected drivers, commits and unmounts.
+4. **Configure** — Set the mount parent directory and force-unsigned option.
+5. **Start** — Mounts each WIM index, injects the validated driver set, and commits only when every operation succeeds.
 
 ## boot.wim vs install.wim Driver Suitability
 
@@ -76,11 +83,22 @@ The tool applies these rules:
 | **boot.wim** | net, SCSIAdapter, HDC, DiskDrive, Volume, SCSI, USB, SDHost, USBFunctionController + System-class storage controllers | MEDIA, Camera, Display, Biometric, Mouse, HIDClass, Bluetooth, SoftwareComponent, Extension, Ports |
 | **install.wim** | All architecture-matched drivers | Architecture-mismatched only |
 
+## Tests
+
+Run the dependency-free regression suite with Windows PowerShell 5.1:
+
+```powershell
+powershell.exe -NoProfile -STA -File .\tests\Run-Tests.ps1
+```
+
+The suite loads the script in `-LibraryOnly` mode, does not display application windows, and does not modify real WIM images.
+
 ## Project Structure
 
 ```
 WIM_Driver_Studio/
-├── WIM_Driver_Studio.ps1   # Main application (single file)
+├── WIM_Driver_Studio.ps1   # Main application
+├── tests/Run-Tests.ps1    # Regression tests
 ├── README.md
 ├── LICENSE
 └── .gitignore

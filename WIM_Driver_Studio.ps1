@@ -9,14 +9,13 @@
     
     This tool provides a secure, user-friendly interface for:
     - Selecting and validating WIM files (boot.wim, install.wim, etc.)
-    - Scanning driver folders for .inf files with parallel processing
+    - Scanning driver folders for .inf files with optional recursive traversal
     - Injecting selected drivers into all WIM indexes
     - Real-time progress monitoring and detailed logging
     - Comprehensive error handling and recovery mechanisms
     
-.PARAMETER None
-    This is a GUI application that doesn't accept command-line parameters.
-    All configuration is done through the user interface.
+.PARAMETER LibraryOnly
+    Loads core types and functions without launching WPF. Intended for automated tests.
     
 .INPUTS
     None. This script does not accept pipeline input.
@@ -25,12 +24,12 @@
     GUI Application Window. Detailed logs are displayed in the UI and written to verbose stream.
     
 .EXAMPLE
-    .\WIM-Driver-Injection-Tool.ps1
+    .\WIM_Driver_Studio.ps1
     
     Launches the GUI application for interactive driver injection.
     
 .EXAMPLE
-    Start-Process PowerShell -ArgumentList "-File .\WIM-Driver-Injection-Tool.ps1" -Verb RunAs
+    Start-Process PowerShell -ArgumentList "-File .\WIM_Driver_Studio.ps1" -Verb RunAs
     
     Launches the application with administrator privileges (recommended).
     
@@ -41,7 +40,7 @@
     
     Compatibility: Tested and verified on Windows PowerShell 5.1
     Security: Enhanced input validation, secure process execution, path traversal protection
-    Performance: Optimized with parallel processing and efficient UI updates
+    Performance: Asynchronous long-running operations and efficient UI updates
     
     SECURITY NOTICE:
     This tool requires administrator privileges and can modify system images.
@@ -50,7 +49,10 @@
 
 # Strict compatibility and security requirements
 #Requires -Version 5.1
-#Requires -RunAsAdministrator
+
+param(
+    [switch]$LibraryOnly
+)
 
 #region 1. Core Initialization and Assembly Management
 <#
@@ -115,8 +117,7 @@ public static class DpiHelper {
     public static bool SetDpiAwareness() {
         try {
             // Try modern method first (Windows 8.1+)
-            if (Environment.OSVersion.Version.Major >= 6 && 
-                Environment.OSVersion.Version.Minor >= 3) {
+            if (Environment.OSVersion.Version >= new Version(6, 3)) {
                 return SetProcessDpiAwareness(2) == 0; // PROCESS_PER_MONITOR_DPI_AWARE
             } else {
                 return SetProcessDPIAware(); // Fallback for older Windows versions
@@ -130,13 +131,17 @@ public static class DpiHelper {
     
     # Only add the type if it doesn't already exist (prevents re-compilation errors)
     if (-not ([System.Management.Automation.PSTypeName]'DpiHelper').Type) {
-        Add-Type -TypeDefinition $dpiHelperCode -ErrorAction SilentlyContinue
+        Add-Type -TypeDefinition $dpiHelperCode -ErrorAction Stop
         Write-Verbose "DPI Helper class compiled successfully"
     }
     
-    # Set DPI awareness with error handling
-    $dpiResult = [DpiHelper]::SetDpiAwareness()
-    Write-Verbose "DPI Awareness configured: $dpiResult"
+    try {
+        $dpiResult = [DpiHelper]::SetDpiAwareness()
+        Write-Verbose "DPI Awareness configured: $dpiResult"
+    }
+    catch {
+        Write-Verbose "DPI awareness is unavailable; continuing with system defaults."
+    }
     
     Write-Verbose "Core initialization completed successfully"
 }
@@ -264,13 +269,6 @@ $script:Configuration = [PSCustomObject]@{
     IndexInventoryProgressPercent = 0.15     # 15% for driver inventory per index
     IndexRemovalProgressPercent   = 0.25       # 25% for driver removal per index
 
-    # UI performance and threading settings
-    CleanupMonitorIntervalMs      = 1000       # 1 second cleanup monitoring interval
-    ProgressUpdateBatchSize       = 20         # Batch UI updates for performance
-    ParallelProcessingThreshold   = 10         # Minimum drivers for parallel processing
-    MaxParallelThreads            = [Math]::Min([Environment]::ProcessorCount, 8) # CPU-based threading
-    DriverDisplayBatchSize        = 50         # Maximum drivers to display per batch
-
     # Output length limits for security and performance
     DismOutputMaxChars            = 500        # Maximum DISM output characters to display
     DismErrorMaxChars             = 250        # Maximum DISM error output to display
@@ -285,10 +283,8 @@ $script:Configuration = [PSCustomObject]@{
     DismGetDriverInfo             = '/Get-DriverInfo'     # Command to get detailed driver info
     DismRemoveDriver              = '/Remove-Driver'      # Command to remove drivers
     DismExportDriver              = '/Export-Driver'      # Command to export drivers
-    DismCleanupMountpoints        = '/Cleanup-Mountpoints' # Global cleanup command
     DismIndexFlag                 = '/Index:'             # Index specification flag
     DismMountDirFlag              = '/MountDir:'          # Mount directory flag
-    DismRecurseFlag               = '/Recurse'            # Recursive driver search flag
     DismForceUnsignedFlag         = '/ForceUnsigned'      # Force unsigned driver flag
     DismCommitFlag                = '/Commit'             # Commit changes flag
     DismDiscardFlag               = '/Discard'            # Discard changes flag
@@ -374,6 +370,7 @@ $script:DriverOutputPatterns = @{
     DriverDate       = [regex]::new('Driver Date\s*:\s*(.+)', [System.Text.RegularExpressions.RegexOptions]::Compiled)
     DriverVersion    = [regex]::new('Driver Version\s*:\s*(.+)', [System.Text.RegularExpressions.RegexOptions]::Compiled)
     InboxDriver      = [regex]::new('Inbox\s*:\s*(.+)', [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    IsBootCritical  = [regex]::new('Boot Critical\s*:\s*(Yes|No)', [System.Text.RegularExpressions.RegexOptions]::Compiled)
 }
 
 Write-Verbose "Enhanced configuration and security constants with driver management initialized successfully"
@@ -545,87 +542,20 @@ class DriverInfo {
     
     [void] VerifySignature() {
         try {
-            # First, try to check the INF file itself (some newer packages sign the INF)
-            try {
-                $infSignature = Get-AuthenticodeSignature -FilePath $this.FullPath -ErrorAction Stop
-                if ($infSignature.Status -eq 'Valid') {
-                    $this.SignatureStatus = 'Signed'
-                    return
-                }
+            $infSignature = Get-AuthenticodeSignature -FilePath $this.FullPath -ErrorAction Stop
+            if ($infSignature.Status -eq 'Valid') {
+                $this.SignatureStatus = 'Signed'
+                return
             }
-            catch { }
             
-            # For driver packages, check for catalog files or signed sys files in the same directory
             $driverDir = [System.IO.Path]::GetDirectoryName($this.FullPath)
             $infName = [System.IO.Path]::GetFileNameWithoutExtension($this.FullPath)
-            
-            # Look for catalog file with same name as INF
             $catFile = [System.IO.Path]::Combine($driverDir, "$infName.cat")
             if ([System.IO.File]::Exists($catFile)) {
-                try {
-                    $catSignature = Get-AuthenticodeSignature -FilePath $catFile -ErrorAction Stop
-                    if ($catSignature.Status -eq 'Valid') {
-                        $this.SignatureStatus = 'Signed'
-                        return
-                    }
-                }
-                catch { }
+                $this.SignatureStatus = 'Unknown'
+                return
             }
             
-            # Look for any .cat files in the same directory
-            try {
-                $catFiles = [System.IO.Directory]::GetFiles($driverDir, "*.cat")
-                foreach ($cat in $catFiles) {
-                    try {
-                        $catSignature = Get-AuthenticodeSignature -FilePath $cat -ErrorAction Stop
-                        if ($catSignature.Status -eq 'Valid') {
-                            $this.SignatureStatus = 'Signed'
-                            return
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch { }
-            
-            # Look for signed .sys files mentioned in the INF
-            try {
-                $infContent = [System.IO.File]::ReadAllText($this.FullPath)
-                $sysMatches = [regex]::Matches($infContent, '(\w+\.sys)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                
-                foreach ($match in $sysMatches) {
-                    $sysFile = [System.IO.Path]::Combine($driverDir, $match.Groups[1].Value)
-                    if ([System.IO.File]::Exists($sysFile)) {
-                        try {
-                            $sysSignature = Get-AuthenticodeSignature -FilePath $sysFile -ErrorAction Stop
-                            if ($sysSignature.Status -eq 'Valid') {
-                                $this.SignatureStatus = 'Signed'
-                                return
-                            }
-                        }
-                        catch { }
-                    }
-                }
-                
-                # Also check for .dll files that might be signed
-                $dllMatches = [regex]::Matches($infContent, '(\w+\.dll)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                foreach ($match in $dllMatches) {
-                    $dllFile = [System.IO.Path]::Combine($driverDir, $match.Groups[1].Value)
-                    if ([System.IO.File]::Exists($dllFile)) {
-                        try {
-                            $dllSignature = Get-AuthenticodeSignature -FilePath $dllFile -ErrorAction Stop
-                            if ($dllSignature.Status -eq 'Valid') {
-                                $this.SignatureStatus = 'Signed'
-                                return
-                            }
-                        }
-                        catch { }
-                    }
-                }
-            }
-            catch { }
-            
-            # If no signed files found, mark as unsigned
             $this.SignatureStatus = 'Unsigned'
         }
         catch {
@@ -681,8 +611,27 @@ class InstalledDriverInfo {
         $this.ProviderName = if ($null -ne $properties.ProviderName) { $properties.ProviderName } else { "Unknown" }
         $this.DriverDate = if ($null -ne $properties.DriverDate) { $properties.DriverDate } else { "Unknown" }
         $this.DriverVersion = if ($null -ne $properties.DriverVersion) { $properties.DriverVersion } else { "Unknown" }
-        $this.IsInboxDriver = if ($null -ne $properties.InboxDriver) { [bool]$properties.InboxDriver } else { $false }
-        $this.IsBootCritical = $this.DetermineBootCritical()
+        if ($null -ne $properties.InboxDriver) {
+            if ($properties.InboxDriver -is [bool]) {
+                $this.IsInboxDriver = $properties.InboxDriver
+            }
+            else {
+                $this.IsInboxDriver = ([string]$properties.InboxDriver -match '^(yes|true|1)$')
+            }
+        }
+
+        if ($null -ne $properties.IsBootCritical) {
+            if ($properties.IsBootCritical -is [bool]) {
+                $this.IsBootCritical = $properties.IsBootCritical
+            }
+            else {
+                $this.IsBootCritical = ([string]$properties.IsBootCritical -match '^(yes|true|1)$')
+            }
+        }
+        else {
+            $this.IsBootCritical = $true
+        }
+
         $this.CanBeRemoved = $this.DetermineRemovability()
         $this.Status = if ($null -ne $properties.Status) { $properties.Status } else { "Installed" }
         $this.Architecture = if ($null -ne $properties.Architecture) { $properties.Architecture } else { "Unknown" }
@@ -846,6 +795,10 @@ class ThreadSafeApplicationState {
     [System.Collections.ArrayList] $DiscoveredDrivers
     [System.Collections.ArrayList] $InstalledDrivers
     [DriverManagementOperation] $_currentOperation
+    [string] $_currentMountPath
+    [int] $_currentInventoryIndex
+    [int[]] $_currentWimIndexes
+    [System.Collections.Concurrent.ConcurrentDictionary[string, System.Diagnostics.Process]] $_activeProcesses
     
     ThreadSafeApplicationState() {
         $this.DiscoveredDrivers = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
@@ -992,9 +945,57 @@ class ThreadSafeApplicationState {
         }
     }
 
+    [string] GetCurrentMountPath() {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { return $this._currentMountPath }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
+    [void] SetCurrentMountPath([string]$value) {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { $this._currentMountPath = $value }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
+    [int] GetCurrentInventoryIndex() {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { return $this._currentInventoryIndex }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
+    [void] SetCurrentInventoryIndex([int]$value) {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { $this._currentInventoryIndex = $value }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
+    [int[]] GetCurrentWimIndexes() {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { return $this._currentWimIndexes }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
+    [void] SetCurrentWimIndexes([int[]]$value) {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { $this._currentWimIndexes = $value }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
+    [System.Collections.Concurrent.ConcurrentDictionary[string, System.Diagnostics.Process]] GetActiveProcesses() {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { return $this._activeProcesses }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
+    [void] SetActiveProcesses([System.Collections.Concurrent.ConcurrentDictionary[string, System.Diagnostics.Process]]$value) {
+        [System.Threading.Monitor]::Enter($this.syncRoot)
+        try { $this._activeProcesses = $value }
+        finally { [System.Threading.Monitor]::Exit($this.syncRoot) }
+    }
+
     [bool] IsProcessing() {
         $state = $this.GetCurrentState()
-        return $state -in @('Scanning', 'Processing', 'InventoryingDrivers', 'RemovingDrivers')
+        return $state -in @('Scanning', 'Processing', 'InventoryingDrivers', 'RemovingDrivers', 'Cancelling')
     }
     
     [bool] CanCancel() {
@@ -1012,6 +1013,10 @@ class ThreadSafeApplicationState {
             $this._eventSubscription = $null
             $this._backgroundResult = $null
             $this._currentOperation = $null
+            $this._currentMountPath = $null
+            $this._currentInventoryIndex = 0
+            $this._currentWimIndexes = $null
+            $this._activeProcesses = $null
         }
         finally {
             [System.Threading.Monitor]::Exit($this.syncRoot)
@@ -1043,6 +1048,18 @@ $script:LastProgressUpdate = [DateTime]::MinValue
 # Used to partition discovered drivers into suitable / not-recommended groups.
 $script:CurrentWimImageType = [WimImageType]::Unknown
 $script:CurrentWimArchitecture = 'Unknown'
+$script:CurrentMountPath = $null
+$script:CurrentInventoryIndex = $null
+
+function Set-CurrentWimClassification {
+    param(
+        [WimImageType]$ImageType,
+        [string]$Architecture
+    )
+
+    $script:CurrentWimImageType = $ImageType
+    $script:CurrentWimArchitecture = $Architecture
+}
 
 Write-Verbose "Global state management initialized"
 #endregion
@@ -1659,53 +1676,35 @@ function Test-DismToolAvailability {
     
     process {
         try {
-            Write-Verbose "Verifying DISM tool availability and functionality..."
+            $dismPath = Get-TrustedDismPath
+            $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $processInfo.FileName = $dismPath
+            $processInfo.Arguments = '/?'
+            $processInfo.UseShellExecute = $false
+            $processInfo.CreateNoWindow = $true
+            $processInfo.RedirectStandardOutput = $true
+            $processInfo.RedirectStandardError = $true
             
-            # Step 1: Check if DISM command is available
+            $process = [System.Diagnostics.Process]::Start($processInfo)
             try {
-                $dismCommand = Get-Command "dism.exe" -ErrorAction Stop
-                Write-Verbose "DISM found at: $($dismCommand.Source)"
-            }
-            catch [System.Management.Automation.CommandNotFoundException] {
-                Write-Warning "DISM tool not found in system PATH. Please install Windows ADK or verify Windows installation."
-                return $false
-            }
-            
-            # Step 2: Verify DISM is in expected system location for security
-            $expectedPath = [System.IO.Path]::Combine($env:SystemRoot, "System32", "dism.exe")
-            if ($dismCommand.Source -ne $expectedPath) {
-                Write-Warning "DISM found at unexpected location: $($dismCommand.Source). Expected: $expectedPath"
-                Write-Warning "This may indicate a modified or non-standard installation."
-            }
-            
-            # Step 3: Test DISM basic functionality with a safe command
-            try {
-                $tempOut = [System.IO.Path]::GetTempFileName()
-                $tempErr = [System.IO.Path]::GetTempFileName()
-                try {
-                    $testProcess = Start-Process -FilePath "dism.exe" -ArgumentList "/?" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr
-                
-                    if ($testProcess.ExitCode -eq 0) {
-                        Write-Verbose "DISM tool responded successfully to help command"
-                        return $true
-                    }
-                    else {
-                        Write-Warning "DISM tool returned error code: $($testProcess.ExitCode)"
-                        return $false
-                    }
+                $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                $stderrTask = $process.StandardError.ReadToEndAsync()
+                if (-not $process.WaitForExit(30000)) {
+                    $process.Kill()
+                    $process.WaitForExit(5000) | Out-Null
+                    return $false
                 }
-                finally {
-                    Remove-Item -LiteralPath $tempOut -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath $tempErr -Force -ErrorAction SilentlyContinue
-                }
+
+                $stdoutTask.Wait(5000) | Out-Null
+                $stderrTask.Wait(5000) | Out-Null
+                return ($process.ExitCode -eq 0)
             }
-            catch {
-                Write-Warning "Failed to execute DISM test command: $($_.Exception.Message)"
-                return $false
+            finally {
+                $process.Dispose()
             }
         }
         catch {
-            Write-Warning "Unexpected error during DISM availability check: $($_.Exception.Message)"
+            Write-Warning "DISM availability check failed: $($_.Exception.Message)"
             return $false
         }
     }
@@ -1749,8 +1748,197 @@ function Protect-SensitiveOutput {
             $sanitizedText = $pattern.Replace($sanitizedText, '***REDACTED***')
         }
         
+        $sanitizedText = [regex]::Replace($sanitizedText, '(?i)([a-z]:\\users\\)[^\\]+', '$1%USER%')
         return $sanitizedText
     }
+}
+
+function ConvertTo-NativeArgument {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashCount = 0
+
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashCount++
+            continue
+        }
+
+        if ($character -eq '"') {
+            [void]$builder.Append('\', ($backslashCount * 2 + 1))
+            [void]$builder.Append('"')
+            $backslashCount = 0
+            continue
+        }
+
+        [void]$builder.Append('\', $backslashCount)
+        [void]$builder.Append($character)
+        $backslashCount = 0
+    }
+
+    [void]$builder.Append('\', ($backslashCount * 2))
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-TrustedDismPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $dismPath = [System.IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\dism.exe'))
+    if (-not [System.IO.File]::Exists($dismPath)) {
+        throw "DISM was not found at the trusted system path: $dismPath"
+    }
+
+    return $dismPath
+}
+
+function Get-ApplicationMountMarkerPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$MountPath
+    )
+
+    $fullMountPath = [System.IO.Path]::GetFullPath($MountPath).TrimEnd('\')
+    return "$fullMountPath.wim-driver-studio-owner.json"
+}
+
+function Test-ApplicationMountDirectory {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$MountPath
+    )
+
+    if (-not [System.IO.Directory]::Exists($MountPath)) {
+        return $false
+    }
+
+    $markerPath = Get-ApplicationMountMarkerPath -MountPath $MountPath
+    if (-not [System.IO.File]::Exists($markerPath)) {
+        return $false
+    }
+
+    try {
+        $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        return ($marker.Owner -eq 'WIM Driver Studio' -and $marker.MountPath -eq [System.IO.Path]::GetFullPath($MountPath))
+    }
+    catch {
+        return $false
+    }
+}
+
+function New-ApplicationMountDirectory {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ParentPath
+    )
+
+    $fullParentPath = [System.IO.Path]::GetFullPath($ParentPath)
+    [System.IO.Directory]::CreateDirectory($fullParentPath) | Out-Null
+    $mountPath = Join-Path $fullParentPath ('WIMDS-' + [Guid]::NewGuid().ToString('N'))
+    [System.IO.Directory]::CreateDirectory($mountPath) | Out-Null
+
+    $marker = [PSCustomObject]@{
+        Owner     = 'WIM Driver Studio'
+        MountPath = [System.IO.Path]::GetFullPath($mountPath)
+        CreatedAt = [DateTime]::UtcNow.ToString('o')
+    }
+    $marker | ConvertTo-Json | Out-File -LiteralPath (Get-ApplicationMountMarkerPath -MountPath $mountPath) -Encoding UTF8
+    return $mountPath
+}
+
+function Clear-ApplicationMountDirectory {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$MountPath
+    )
+
+    if (-not (Test-ApplicationMountDirectory -MountPath $MountPath)) {
+        return $false
+    }
+
+    try {
+        Remove-Item -LiteralPath $MountPath -Recurse -Force -ErrorAction Stop
+        Remove-Item -LiteralPath (Get-ApplicationMountMarkerPath -MountPath $MountPath) -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    catch {
+        Write-Verbose "Could not remove application mount directory '$MountPath': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function New-OperationMessageQueue {
+    [CmdletBinding()]
+    [OutputType([System.Collections.Concurrent.ConcurrentQueue[object]])]
+    param()
+
+    return ,([System.Collections.Concurrent.ConcurrentQueue[object]]::new())
+}
+
+function Send-OperationMessage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Concurrent.ConcurrentQueue[object]]$Queue,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [string]$Level = 'Info',
+
+        [double]$Progress = 0,
+
+        [string]$Status = ''
+    )
+
+    $Queue.Enqueue([PSCustomObject]@{
+        Message  = $Message
+        Level    = $Level
+        Progress = $Progress
+        Status   = $Status
+    })
+}
+
+function Take-OperationMessage {
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Concurrent.ConcurrentQueue[object]]$Queue
+    )
+
+    $item = $null
+    if ($Queue.TryDequeue([ref]$item)) {
+        return $item
+    }
+
+    return $null
 }
 
 Write-Verbose "Enhanced security and validation functions loaded successfully"
@@ -1792,6 +1980,69 @@ Write-Verbose "Enhanced security and validation functions loaded successfully"
 .OUTPUTS
     Hashtable with Success, ExitCode, StandardOutput, StandardError, and Duration
 #>
+function New-DismProcessStartInfo {
+    [CmdletBinding()]
+    [OutputType([System.Diagnostics.ProcessStartInfo])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('/Get-WimInfo', '/Mount-Image', '/Unmount-Image', '/Add-Driver', '/Get-Drivers', '/Get-DriverInfo', '/Remove-Driver', '/Export-Driver')]
+        [string]$Operation,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Arguments = @{}
+    )
+
+    $argumentList = [System.Collections.Generic.List[string]]::new()
+    $argumentList.Add('/English')
+    $argumentList.Add($Operation)
+
+    foreach ($key in $Arguments.Keys) {
+        $value = $Arguments[$key]
+        switch ($key) {
+            'ImageFile' { $argumentList.Add('/ImageFile:' + (ConvertTo-NativeArgument -Value ([string]$value))) }
+            'WimFile' { $argumentList.Add('/WimFile:' + (ConvertTo-NativeArgument -Value ([string]$value))) }
+            'Image' { $argumentList.Add('/Image:' + (ConvertTo-NativeArgument -Value ([string]$value))) }
+            'MountDir' { $argumentList.Add('/MountDir:' + (ConvertTo-NativeArgument -Value ([string]$value))) }
+            'Index' {
+                $parsedIndex = 0
+                if (-not [int]::TryParse([string]$value, [ref]$parsedIndex) -or $parsedIndex -le 0) {
+                    throw "Invalid DISM image index: $value"
+                }
+                $argumentList.Add("/Index:$parsedIndex")
+            }
+            'Driver' {
+                $drivers = @($value)
+                foreach ($driver in $drivers) {
+                    $argumentList.Add('/Driver:' + (ConvertTo-NativeArgument -Value ([string]$driver)))
+                }
+            }
+            'Destination' { $argumentList.Add('/Destination:' + (ConvertTo-NativeArgument -Value ([string]$value))) }
+            'Recurse' { if ([bool]$value) { $argumentList.Add('/Recurse') } }
+            'ForceUnsigned' { if ([bool]$value) { $argumentList.Add('/ForceUnsigned') } }
+            'All' { if ([bool]$value) { $argumentList.Add('/All') } }
+            'Format' {
+                if ($value -notin @('Table', 'List')) {
+                    throw "Unsupported DISM output format: $value"
+                }
+                $argumentList.Add("/Format:$value")
+            }
+            'Commit' { if ([bool]$value) { $argumentList.Add('/Commit') } }
+            'Discard' { if ([bool]$value) { $argumentList.Add('/Discard') } }
+            default { throw "Unsupported DISM argument: $key" }
+        }
+    }
+
+    $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $processInfo.FileName = Get-TrustedDismPath
+    $processInfo.Arguments = $argumentList -join ' '
+    $processInfo.UseShellExecute = $false
+    $processInfo.CreateNoWindow = $true
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.RedirectStandardError = $true
+    $processInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    return $processInfo
+}
+
 function Invoke-EnhancedDismOperation {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -1813,124 +2064,59 @@ function Invoke-EnhancedDismOperation {
     }
     
     process {
+        $process = $null
+        $processKey = $null
         try {
             Write-Verbose "Enhanced DISM operation: $Operation"
             
-            # Build argument list with proper formatting
-            $argumentList = [System.Collections.Generic.List[string]]::new()
-            $argumentList.Add($Operation)
-            
-            # Process arguments with correct formatting
-            foreach ($key in $Arguments.Keys) {
-                $value = $Arguments[$key]
-                
-                switch ($key) {
-                    'ImageFile' { 
-                        $argumentList.Add("/ImageFile:`"$value`"")
-                    }
-                    'WimFile' { 
-                        $argumentList.Add("/WimFile:`"$value`"")
-                    }
-                    'Image' { 
-                        $argumentList.Add("/Image:`"$value`"")
-                    }
-                    'MountDir' { 
-                        $argumentList.Add("/MountDir:`"$value`"")
-                    }
-                    'Index' { 
-                        $argumentList.Add("/Index:$value")
-                    }
-                    'Driver' { 
-                        if ($value -is [array]) {
-                            foreach ($driver in $value) {
-                                $argumentList.Add("/Driver:`"$driver`"")
-                            }
-                        }
-                        else {
-                            $argumentList.Add("/Driver:`"$value`"")
-                        }
-                    }
-                    'Destination' { 
-                        $argumentList.Add("/Destination:`"$value`"")
-                    }
-                    'Recurse' { 
-                        if ([bool]$value) { $argumentList.Add("/Recurse") }
-                    }
-                    'ForceUnsigned' { 
-                        if ([bool]$value) { $argumentList.Add("/ForceUnsigned") }
-                    }
-                    'All' { 
-                        if ([bool]$value) { $argumentList.Add("/All") }
-                    }
-                    'Format' { 
-                        $argumentList.Add("/Format:$value")
-                    }
-                    'Commit' {
-                        if ([bool]$value) { $argumentList.Add("/Commit") }
-                    }
-                    'Discard' {
-                        if ([bool]$value) { $argumentList.Add("/Discard") }
-                    }
-                    default {
-                        Write-Verbose "Unknown argument: $key with value: $value"
-                    }
-                }
-            }
-            
-            # Execute with simplified process management
-            $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
-            $processInfo.FileName = "dism.exe"
-            $processInfo.Arguments = $argumentList -join ' '
-            $processInfo.UseShellExecute = $false
-            $processInfo.CreateNoWindow = $true
-            $processInfo.RedirectStandardOutput = $true
-            $processInfo.RedirectStandardError = $true
-            $processInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-            
-            Write-Verbose "Executing: dism.exe $($processInfo.Arguments)"
+            $processInfo = New-DismProcessStartInfo -Operation $Operation -Arguments $Arguments
+            Write-Verbose "Executing: $($processInfo.FileName) $($processInfo.Arguments)"
             
             $process = [System.Diagnostics.Process]::Start($processInfo)
             $script:ApplicationState.SetCurrentProcess($process)
-            
+            if ($null -ne $script:SharedActiveProcesses) {
+                $processKey = [Guid]::NewGuid().ToString('N')
+                $script:SharedActiveProcesses[$processKey] = $process
+            }
+
             $stdoutTask = $process.StandardOutput.ReadToEndAsync()
             $stderrTask = $process.StandardError.ReadToEndAsync()
 
-            # Wait for completion with timeout
-            $completed = $process.WaitForExit($TimeoutMs)
-            $endTime = [DateTime]::Now
-            $duration = $endTime - $startTime
-            
-            if (-not $completed) {
-                Write-Warning "DISM operation timed out after $($TimeoutMs / 1000) seconds"
+            if (-not $process.WaitForExit($TimeoutMs)) {
                 try {
                     $process.Kill()
-                    $process.WaitForExit(5000)
+                    $process.WaitForExit(5000) | Out-Null
                 }
                 catch {
-                    Write-Warning "Failed to kill timed out DISM process: $($_.Exception.Message)"
+                    Write-Verbose "Timed-out DISM process had already exited or could not be terminated."
                 }
                 
                 return @{
                     Success        = $false
                     ExitCode       = -1
-                    StandardOutput = ""
+                    StandardOutput = ''
                     StandardError  = "Operation timed out after $($TimeoutMs / 1000) seconds"
-                    Duration       = $duration
+                    Duration       = ([DateTime]::Now - $startTime)
                     TimedOut       = $true
                 }
             }
             
-            # Capture output from async tasks
+            if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
+                return @{
+                    Success        = $false
+                    ExitCode       = -1
+                    StandardOutput = ''
+                    StandardError  = 'DISM exited but its output streams did not close within the timeout.'
+                    Duration       = ([DateTime]::Now - $startTime)
+                    TimedOut       = $true
+                }
+            }
+
             $standardOutput = $stdoutTask.Result
             $standardError = $stderrTask.Result
             $exitCode = $process.ExitCode
-            
-            # Clean up
-            $process.Dispose()
-            $script:ApplicationState.SetCurrentProcess($null)
-            
-            # Determine success
             $success = ($exitCode -eq 0)
+            $duration = [DateTime]::Now - $startTime
             
             if ($success) {
                 Write-Verbose "DISM operation completed successfully in $($duration.TotalSeconds) seconds"
@@ -1952,18 +2138,34 @@ function Invoke-EnhancedDismOperation {
             }
         }
         catch {
-            $endTime = [DateTime]::Now
-            $duration = $endTime - $startTime
-            
-            Write-Error "Enhanced DISM operation failed: $($_.Exception.Message)"
-            
             return @{
                 Success        = $false
                 ExitCode       = -2
-                StandardOutput = ""
+                StandardOutput = ''
                 StandardError  = "Exception: $($_.Exception.Message)"
-                Duration       = $duration
+                Duration       = ([DateTime]::Now - $startTime)
                 TimedOut       = $false
+            }
+        }
+        finally {
+            if ($null -ne $process) {
+                try {
+                    if (-not $process.HasExited) {
+                        $process.Kill()
+                        $process.WaitForExit(5000) | Out-Null
+                    }
+                }
+                catch {
+                    Write-Verbose "DISM process cleanup warning: $($_.Exception.Message)"
+                }
+
+                if ($null -ne $processKey -and $null -ne $script:SharedActiveProcesses) {
+                    $null = $script:SharedActiveProcesses.TryRemove($processKey, [ref]$null)
+                }
+                $process.Dispose()
+                if ([object]::ReferenceEquals($script:ApplicationState.GetCurrentProcess(), $process)) {
+                    $script:ApplicationState.SetCurrentProcess($null)
+                }
             }
         }
     }
@@ -2124,6 +2326,7 @@ function ConvertFrom-DriverTableOutput {
                         DriverDate       = $matches[5].Trim()
                         DriverVersion    = $matches[6].Trim()
                         InboxDriver      = ($matches[7].Trim() -eq "Yes")
+                        IsBootCritical   = $true
                     }
                     
                     $driver = [InstalledDriverInfo]::new($properties)
@@ -2185,6 +2388,7 @@ function ConvertFrom-DriverListOutput {
                         DriverDate = "Unknown"
                         DriverVersion = "Unknown"
                         InboxDriver = $false
+                        IsBootCritical = $true
                     }
                 }
                 elseif ($currentDriver) {
@@ -2550,6 +2754,9 @@ function Export-DriversFromMountedImage {
                 Image       = $MountPath
                 Destination = $DestinationPath
             }
+            if ($DriversToExport.Count -gt 0) {
+                $arguments.Driver = @($DriversToExport | ForEach-Object { $_.PublishedName })
+            }
             
             $result = Invoke-EnhancedDismOperation -Operation $script:Configuration.DismExportDriver -Arguments $arguments -TimeoutMs 300000
             
@@ -2597,7 +2804,9 @@ function Get-DriversRecursive {
     param(
         [Parameter(Mandatory = $true)]
         [ValidateScript({ Test-Path $_ -PathType Container })]
-        [string]$RootPath
+        [string]$RootPath,
+
+        [switch]$Recurse = $true
     )
     
     process {
@@ -2613,7 +2822,8 @@ function Get-DriversRecursive {
             }
             
             $securePath = $pathValidation.ResolvedPath
-            $discoveredFiles = [System.IO.Directory]::GetFiles($securePath, "*.inf", [System.IO.SearchOption]::AllDirectories)
+            $searchOption = if ($Recurse) { [System.IO.SearchOption]::AllDirectories } else { [System.IO.SearchOption]::TopDirectoryOnly }
+            $discoveredFiles = [System.IO.Directory]::GetFiles($securePath, "*.inf", $searchOption)
             
             Write-Verbose "Found $($discoveredFiles.Count) INF files for processing"
             
@@ -2964,7 +3174,7 @@ function Test-IsStorageControllerDriver {
 
 .DESCRIPTION
     Rules:
-    - Unknown image type -> allow by default (cannot judge).
+    - Unknown image type -> require manual verification (fail closed).
     - Architecture gate -> if the image architecture is known and the driver does
       not support it, reject with 'Architecture mismatch'.
     - install.wim -> any architecture-matched driver is suitable.
@@ -3009,19 +3219,28 @@ function Test-DriverSuitabilityForImage {
             $result.Class = $class
 
             if ($ImageType -eq [WimImageType]::Unknown) {
-                $result.Suitable = $true
-                $result.Reason = 'Image type unknown - allowed by default'
+                $result.Suitable = $false
+                $result.Reason = 'Image type could not be determined - manual verification required'
                 return $result
             }
 
-            if (-not [string]::IsNullOrWhiteSpace($ImageArchitecture) -and ($ImageArchitecture -ne 'Unknown')) {
-                $supported = @(Get-InfSupportedArchitectures -InfPath $infPath)
-                if (($supported.Count -gt 0) -and ($supported -notcontains $ImageArchitecture)) {
-                    $supportedText = $supported -join '/'
-                    $result.Suitable = $false
-                    $result.Reason = "Architecture mismatch (driver: $supportedText, image: $ImageArchitecture)"
-                    return $result
-                }
+            if ([string]::IsNullOrWhiteSpace($ImageArchitecture) -or $ImageArchitecture -eq 'Unknown') {
+                $result.Suitable = $false
+                $result.Reason = 'Image architecture could not be determined - manual verification required'
+                return $result
+            }
+
+            $supported = @(Get-InfSupportedArchitectures -InfPath $infPath)
+            if ($supported.Count -eq 0) {
+                $result.Suitable = $false
+                $result.Reason = 'Driver architecture could not be determined - manual verification required'
+                return $result
+            }
+            if ($supported -notcontains $ImageArchitecture) {
+                $supportedText = $supported -join '/'
+                $result.Suitable = $false
+                $result.Reason = "Architecture mismatch (driver: $supportedText, image: $ImageArchitecture)"
+                return $result
             }
 
             if ($ImageType -eq [WimImageType]::Install) {
@@ -3055,13 +3274,13 @@ function Test-DriverSuitabilityForImage {
                 return $result
             }
 
-            $result.Suitable = $true
-            $result.Reason = 'Allowed by default'
+            $result.Suitable = $false
+            $result.Reason = 'Unsupported image type - manual verification required'
             return $result
         }
         catch {
-            $result.Suitable = $true
-            $result.Reason = "Judgment error: $($_.Exception.Message)"
+            $result.Suitable = $false
+            $result.Reason = "Judgment error - manual verification required: $($_.Exception.Message)"
             return $result
         }
     }
@@ -3090,102 +3309,32 @@ function Clear-MountDirectory {
     )
     
     process {
+        if (-not (Test-ApplicationMountDirectory -MountPath $MountPath)) {
+            Write-ApplicationLog "Refusing to clean an unowned mount directory: $MountPath" ([LogLevel]::Warning)
+            return $false
+        }
+
         try {
-            Write-ApplicationLog "Preparing mount directory: $MountPath" ([LogLevel]::Info)
+            $items = @(Get-ChildItem -LiteralPath $MountPath -Force -ErrorAction Stop)
+            if ($items.Count -gt 0) {
+                $unmountResult = Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{
+                    MountDir = $MountPath
+                    Discard  = $true
+                } -TimeoutMs $script:Configuration.QuickCleanupTimeoutMs
             
-            # Step 1: Check if the directory exists
-            if ([System.IO.Directory]::Exists($MountPath)) {
-                Write-ApplicationLog "Existing mount directory found. Initiating cleanup..." ([LogLevel]::Warning)
-
-                # Step 1a: Attempt targeted unmount first
-                Write-Verbose "Attempting targeted unmount on '$MountPath'..."
-                try {
-                    $unmountArgs = @{ MountDir = $MountPath; Discard = $true }
-                    $unmountResult = Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $unmountArgs -TimeoutMs 60000
-                    if ($unmountResult.Success) {
-                        Write-ApplicationLog "Successfully unmounted existing image from the target directory." ([LogLevel]::Success)
-                    } else {
-                        # This is expected if it wasn't a valid mount point
-                        Write-Verbose "Targeted unmount did not succeed (this is okay if it wasn't a mount point)."
-                    }
-                }
-                catch {
-                    Write-Verbose "Exception during targeted unmount (ignoring): $($_.Exception.Message)"
-                }
-
-                # Step 1b: Run global DISM cleanup
-                Write-Verbose "Running global 'dism.exe /Cleanup-Mountpoints' as a fallback..."
-                try {
-                    $cleanupProcess = Start-Process "dism.exe" -ArgumentList "/Cleanup-Mountpoints" -Wait -PassThru -NoNewWindow
-                    if ($cleanupProcess.ExitCode -eq 0) {
-                        Write-ApplicationLog "Global DISM cleanup completed successfully." ([LogLevel]::Info)
-                    } else {
-                        Write-ApplicationLog "Global DISM cleanup reported exit code: $($cleanupProcess.ExitCode)" ([LogLevel]::Warning)
-                    }
-                }
-                catch {
-                    Write-ApplicationLog "Could not run global DISM cleanup: $($_.Exception.Message)" ([LogLevel]::Warning)
-                }
-
-                # Step 1c: After DISM cleanup, try Remove-Item
-                if ([System.IO.Directory]::Exists($MountPath)) {
-                    Write-Verbose "Directory still exists after DISM cleanup. Attempting removal."
-                    Start-Sleep -Seconds 2 # Give file handles a moment to release
-                    
-                    # Check if directory is empty or contains only small temp files
-                    $items = Get-ChildItem -Path $MountPath -Force -ErrorAction SilentlyContinue
-                    if ($items.Count -gt 0) {
-                        Write-Verbose "Directory contains $($items.Count) items"
-                        
-                        # If directory has Windows folder, it's likely still mounted
-                        $windowsPath = Join-Path $MountPath "Windows"
-                        if (Test-Path $windowsPath) {
-                            Write-ApplicationLog "WARNING: Mount directory appears to contain a mounted image. Forcing unmount..." ([LogLevel]::Warning)
-                            
-                            # Force unmount with discard
-                            try {
-                                $forceUnmountArgs = @{ MountDir = $MountPath; Discard = $true }
-                                Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $forceUnmountArgs -TimeoutMs 120000 | Out-Null
-                                Start-Sleep -Seconds 3
-                            }
-                            catch {
-                                Write-ApplicationLog "Force unmount attempt failed: $($_.Exception.Message)" ([LogLevel]::Warning)
-                            }
-                        }
-                    }
-                    
-                    try {
-                        Remove-Item -Path $MountPath -Recurse -Force -ErrorAction Stop
-                        Write-ApplicationLog "Successfully removed mount directory." ([LogLevel]::Info)
-                    }
-                    catch {
-                        # If removal fails, at least try to empty it
-                        Write-ApplicationLog "Could not remove directory, attempting to empty it: $($_.Exception.Message)" ([LogLevel]::Warning)
-                        try {
-                            Get-ChildItem -Path $MountPath -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-                        }
-                        catch {
-                            Write-Verbose "Could not empty directory: $($_.Exception.Message)"
-                        }
-                    }
+                if (-not $unmountResult.Success) {
+                    Write-ApplicationLog "Targeted unmount failed; the owned mount directory was not deleted: $MountPath" ([LogLevel]::Error)
+                    return $false
                 }
             }
 
-            # Step 2: Create a fresh, empty directory for the new mount
-            if (-not [System.IO.Directory]::Exists($MountPath)) {
-                Write-Verbose "Creating a new mount directory at '$MountPath'."
-                [System.IO.Directory]::CreateDirectory($MountPath) | Out-Null
-                Write-ApplicationLog "Mount directory created and ready." ([LogLevel]::Success)
+            foreach ($item in $items) {
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
             }
-            else {
-                Write-ApplicationLog "Mount directory exists and is ready." ([LogLevel]::Info)
-            }
-
             return $true
         }
         catch {
-            Write-Error "Failed to prepare mount directory: $($_.Exception.Message)"
-            Write-ApplicationLog "Failed to prepare mount directory: $($_.Exception.Message)" ([LogLevel]::Error)
+            Write-ApplicationLog "Failed to clean the owned mount directory: $($_.Exception.Message)" ([LogLevel]::Error)
             return $false
         }
     }
@@ -3452,6 +3601,10 @@ function Write-ApplicationLog {
         try {
             # Convert level to string if it's an enum
             $levelString = if ($Level -is [string]) { $Level } else { $Level.ToString() }
+            if ($null -ne $script:OperationMessageQueue) {
+                Send-OperationMessage -Queue $script:OperationMessageQueue -Message $Message -Level $levelString
+                return
+            }
             
             # Step 1: Create formatted log entry with security sanitization
             $timestamp = Get-Date -Format "HH:mm:ss"
@@ -3537,6 +3690,11 @@ function Update-ApplicationProgress {
     )
     
     process {
+        if ($null -ne $script:OperationMessageQueue) {
+            Send-OperationMessage -Queue $script:OperationMessageQueue -Message $StatusMessage -Progress $Percentage -Status $StatusMessage
+            return
+        }
+
         try {
             # Rate limit progress updates to prevent resource exhaustion
             if (-not $script:LastProgressUpdate) {
@@ -5314,6 +5472,7 @@ $xamlDefinition = @"
 Write-Verbose "Enhanced Windows 11 Fluent Design XAML with driver management completed"
 #endregion
 
+if (-not $LibraryOnly) {
 #region 11. Enhanced UI Creation and Element Management
 <#
 .SYNOPSIS
@@ -5577,7 +5736,9 @@ $uiElements.BrowseWimButton.Add_Click({
                         $uiElements.DriverPrereqHint.Visibility = [System.Windows.Visibility]::Collapsed
                     }
                 
-                    # Reset installed driver display
+                    # Reset inventory and reclassify any previously scanned drivers.
+                    $script:ApplicationState.InstalledDrivers.Clear()
+                    $script:ApplicationState.SetCurrentInventoryIndex(0)
                     $uiElements.InstalledDriverListPanel.Children.Clear()
                     $noDriversText = [System.Windows.Controls.TextBlock]::new()
                     $noDriversText.Text = "Click 'Inventory Drivers' to scan for installed drivers in this WIM file."
@@ -5587,19 +5748,45 @@ $uiElements.BrowseWimButton.Add_Click({
                     $noDriversText.Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(138, 136, 134))
                     $uiElements.InstalledDriverListPanel.Children.Add($noDriversText) | Out-Null
                 
-                    # Detect target image type and architecture so driver
-                    # suitability can be judged for boot.wim vs install.wim.
-                    $script:CurrentWimImageType = Get-WimImageType -WimFilePath $validation.ResolvedPath
-                    $script:CurrentWimArchitecture = Get-WimArchitecture -WimFilePath $validation.ResolvedPath
-                    $detectedType = $script:CurrentWimImageType.ToString()
-                    Write-ApplicationLog "WIM file selected: $([System.IO.Path]::GetFileName($validation.ResolvedPath))" ([LogLevel]::Info)
-                    Write-ApplicationLog "Detected image type: $detectedType (architecture: $($script:CurrentWimArchitecture))" ([LogLevel]::Info)
-                    if ($script:CurrentWimImageType -eq [WimImageType]::Boot) {
-                        Write-ApplicationLog "boot.wim target: only storage/network drivers will be recommended" ([LogLevel]::Info)
-                    }
-                    elseif ($script:CurrentWimImageType -eq [WimImageType]::Install) {
-                        Write-ApplicationLog "install.wim target: all architecture-matched drivers are suitable" ([LogLevel]::Info)
-                    }
+                    $applicationState = $script:ApplicationState
+                    $selectedWimPath = $validation.ResolvedPath
+                    $uiElements.InventoryDriversButton.IsEnabled = $false
+                    $uiElements.StartButton.IsEnabled = $false
+                    $uiElements.CancelButton.Content = 'Cancel Classification'
+                    $uiElements.CancelButton.IsEnabled = $true
+
+                    $onClassificationCompleted = {
+                        param($Classification)
+                        Set-CurrentWimClassification -ImageType ([WimImageType]$Classification.ImageType) -Architecture ([string]$Classification.Architecture)
+                        $applicationState.SetCurrentWimIndexes(@($Classification.Indexes))
+                        $detectedType = ([WimImageType]$Classification.ImageType).ToString()
+                        Write-ApplicationLog "WIM file selected: $([System.IO.Path]::GetFileName($selectedWimPath))" ([LogLevel]::Info)
+                        Write-ApplicationLog "Detected image type: $detectedType (architecture: $($Classification.Architecture))" ([LogLevel]::Info)
+                        if (([WimImageType]$Classification.ImageType) -eq [WimImageType]::Boot) {
+                            Write-ApplicationLog 'boot.wim target: only storage/network drivers will be recommended' ([LogLevel]::Info)
+                        }
+                        elseif (([WimImageType]$Classification.ImageType) -eq [WimImageType]::Install) {
+                            Write-ApplicationLog 'install.wim target: all architecture-matched drivers are suitable' ([LogLevel]::Info)
+                        }
+                        if ($applicationState.DiscoveredDrivers.Count -gt 0) {
+                            Update-DriverSelectionUI -Drivers $applicationState.DiscoveredDrivers.ToArray()
+                        }
+                    }.GetNewClosure()
+
+                    $onClassificationFinally = {
+                        $uiElements.InventoryDriversButton.IsEnabled = $true
+                        $uiElements.CancelButton.Content = 'Cancel'
+                        $uiElements.CancelButton.IsEnabled = $true
+                        Update-DriverSelectionCount
+                    }.GetNewClosure()
+
+                    $null = Start-AsyncPowerShellWorkflow -ScriptPath $PSCommandPath -Workflow {
+                        @{
+                            ImageType    = (Get-WimImageType -WimFilePath $WimFilePath).ToString()
+                            Architecture = Get-WimArchitecture -WimFilePath $WimFilePath
+                            Indexes      = @(Get-WimIndexes -WimFilePath $WimFilePath)
+                        }
+                    } -Variables @{ WimFilePath = $selectedWimPath } -BusyState 'Processing' -OnCompleted $onClassificationCompleted -OnFinally $onClassificationFinally
                 }
                 else {
                     [System.Windows.MessageBox]::Show(
@@ -5630,537 +5817,404 @@ $uiElements.BrowseWimButton.Add_Click({
 
 # Enhanced Driver Inventory Handler
 $uiElements.InventoryDriversButton.Add_Click({
-        # Prevent re-entry if an operation is already running
-        if ($script:ApplicationState.IsProcessing()) {
-            Write-ApplicationLog "An operation is already in progress. Please wait." ([LogLevel]::Warning)
+        if ($applicationState.IsProcessing()) {
+            Write-ApplicationLog 'An operation is already in progress. Please wait.' ([LogLevel]::Warning)
             return
         }
 
-        # Pre-flight Checks
-        $wimPath = $uiElements.WimFileTextBox.Text
-        if ([string]::IsNullOrWhiteSpace($wimPath) -or $wimPath -eq "No WIM file selected...") {
-            [System.Windows.MessageBox]::Show("Please select a WIM file first.", "No WIM File", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        $wimValidation = Test-WimFileValidation -WimPath $uiElements.WimFileTextBox.Text
+        if (-not $wimValidation.IsValid) {
+            [System.Windows.MessageBox]::Show($wimValidation.ErrorMessage, 'Invalid WIM File', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
             return
         }
 
-        $mountPath = $uiElements.MountDirTextBox.Text
-        $mountPrereqValidation = Test-MountPathPrerequisites -MountPath $mountPath
+        $mountParentValidation = Test-SecurePath -Path $uiElements.MountDirTextBox.Text
+        if (-not $mountParentValidation.IsValid) {
+            [System.Windows.MessageBox]::Show($mountParentValidation.ErrorMessage, 'Invalid Mount Directory', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+            return
+        }
+
+        $mountPrereqValidation = Test-MountPathPrerequisites -MountPath $mountParentValidation.ResolvedPath
         if (-not $mountPrereqValidation.IsValid) {
-            [System.Windows.MessageBox]::Show("Invalid mount directory: $($mountPrereqValidation.ErrorMessage)", "Mount Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+            [System.Windows.MessageBox]::Show($mountPrereqValidation.ErrorMessage, 'Mount Error', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
             return
         }
 
-        # Get WIM Indexes and let user choose one
-        try {
-            $indexes = Get-WimIndexes -WimFilePath $wimPath
-        }
-        catch {
-            [System.Windows.MessageBox]::Show("Failed to read WIM file indexes: $($_.Exception.Message)", "WIM Read Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+        $indexes = @($script:ApplicationState.GetCurrentWimIndexes())
+        if ($indexes.Count -eq 0) {
+            [System.Windows.MessageBox]::Show('WIM classification is still running or failed. Select the WIM again after classification completes.', 'WIM Not Ready', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
             return
         }
 
         $selectedIndex = $indexes[0]
         if ($indexes.Count -gt 1) {
-            $prompt = "This WIM contains multiple indexes ($($indexes -join ', ')).`nPlease enter the index number you want to inventory:"
-            try {
-                [System.Reflection.Assembly]::LoadWithPartialName('Microsoft.VisualBasic') | Out-Null
-                $inputValue = [Microsoft.VisualBasic.Interaction]::InputBox($prompt, "Select WIM Index", $indexes[0])
-                if ([string]::IsNullOrWhiteSpace($inputValue)) {
-                    Write-ApplicationLog "Driver inventory cancelled by user." ([LogLevel]::Info)
-                    return
-                }
-                if ($indexes -contains [int]$inputValue) {
-                    $selectedIndex = [int]$inputValue
-                }
-                else {
-                    [System.Windows.MessageBox]::Show("Invalid index '$inputValue'. Aborting.", "Invalid Input", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-                    return
-                }
+            $inputValue = [Microsoft.VisualBasic.Interaction]::InputBox(
+                "This WIM contains multiple indexes ($($indexes -join ', ')).`nEnter the index to inventory:",
+                'Select WIM Index',
+                [string]$indexes[0]
+            )
+            $parsedIndex = 0
+            if ([string]::IsNullOrWhiteSpace($inputValue)) {
+                return
             }
-            catch {
-                Write-ApplicationLog "Could not show index selection prompt. Defaulting to first index. Error: $($_.Exception.Message)" ([LogLevel]::Warning)
+            if (-not [int]::TryParse($inputValue, [ref]$parsedIndex) -or $indexes -notcontains $parsedIndex) {
+                [System.Windows.MessageBox]::Show("Invalid index '$inputValue'. Aborting.", 'Invalid Input', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                return
             }
+            $selectedIndex = $parsedIndex
         }
 
-        # Show warning for potentially long operation
-        $wimFileInfo = [System.IO.FileInfo]::new($wimPath)
-        $wimSizeGB = [math]::Round($wimFileInfo.Length / 1GB, 1)
-    
+        $wimSizeGB = [math]::Round(([System.IO.FileInfo]::new($wimValidation.ResolvedPath)).Length / 1GB, 1)
         if ($wimSizeGB -gt 2) {
-            $result = [System.Windows.MessageBox]::Show(
-                "LARGE WIM FILE DETECTED ($wimSizeGB GB)`n`nMounting large WIM files can take 10-30 minutes or more.`n`nOperation details will be shown in the log below.`nYou can cancel at any time using the Cancel button.`n`nProceed with driver inventory?", 
-                "Large File Warning", 
+            $confirm = [System.Windows.MessageBox]::Show(
+                "This WIM is $wimSizeGB GB. Inventory may take several minutes.`nProceed?",
+                'Large WIM File',
                 [System.Windows.MessageBoxButton]::YesNo, 
                 [System.Windows.MessageBoxImage]::Information
             )
-            if ($result -eq [System.Windows.MessageBoxResult]::No) {
+            if ($confirm -eq [System.Windows.MessageBoxResult]::No) {
                 return
             }
         }
 
-        # Update UI for Long Operation
-        $script:ApplicationState.SetCurrentState('InventoryingDrivers')
-        $uiElements.InventoryDriversButton.IsEnabled = $false
-        $uiElements.BrowseWimButton.IsEnabled = $false
-        $uiElements.StartButton.IsEnabled = $false
-        $uiElements.InventoryDriversButton.Content = "Scanning..."
-        $uiElements.CancelButton.Content = "Cancel Inventory"
-        $uiElements.CancelButton.IsEnabled = $true
-        $uiElements.MainProgressBar.IsIndeterminate = $false
-        $uiElements.MainProgressBar.Value = 0
-        $uiElements.InstalledDriverListPanel.Children.Clear()
+        $applicationState = $script:ApplicationState
+        $mountPath = $null
+        $runspace = $null
+        $powershell = $null
+        $asyncResult = $null
+        $monitorTimer = $null
+        $journalPath = Get-OperationJournalPath
+        $messageQueue = New-OperationMessageQueue
+        $activeProcesses = [System.Collections.Concurrent.ConcurrentDictionary[string, System.Diagnostics.Process]]::new()
+        $applicationState.SetActiveProcesses($activeProcesses)
     
-        Write-ApplicationLog "Starting driver inventory for WIM: $([System.IO.Path]::GetFileName($wimPath)) (Index: $selectedIndex, Size: $wimSizeGB GB)" ([LogLevel]::Info)
-        Write-ApplicationLog "This operation may take 10-30 minutes for large files. Please be patient." ([LogLevel]::Info)
+        try {
+            $mountPath = New-ApplicationMountDirectory -ParentPath $mountParentValidation.ResolvedPath
+            Write-OperationJournal -JournalPath $journalPath -MountPath $mountPath -WimFilePath $wimValidation.ResolvedPath -Index $selectedIndex -Phase 'InventoryingDrivers'
+            $applicationState.SetCurrentMountPath($mountPath)
+            $applicationState.SetCurrentInventoryIndex($selectedIndex)
+            $applicationState.SetCurrentState('InventoryingDrivers')
+            $applicationState.DiscoveredDrivers.Clear()
 
-        # Create PowerShell Runspace for Real-time Output
-        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-        $runspace.Open()
-    
-        # Pass variables and functions to runspace
-        $runspace.SessionStateProxy.SetVariable("WimFilePath", $wimPath)
-        $runspace.SessionStateProxy.SetVariable("MountDirectory", $mountPath)
-        $runspace.SessionStateProxy.SetVariable("WimIndex", $selectedIndex)
-        $runspace.SessionStateProxy.SetVariable("WimSizeGB", $wimSizeGB)
-        $runspace.SessionStateProxy.SetVariable("Configuration", $script:Configuration)
+            $uiElements.InventoryDriversButton.IsEnabled = $false
+            $uiElements.BrowseWimButton.IsEnabled = $false
+            $uiElements.BrowseMountButton.IsEnabled = $false
+            $uiElements.ScanDriversButton.IsEnabled = $false
+            $uiElements.RemoveDriversButton.IsEnabled = $false
+            $uiElements.ExportDriversButton.IsEnabled = $false
+            $uiElements.StartButton.IsEnabled = $false
+            $uiElements.InventoryDriversButton.Content = 'Scanning...'
+            $uiElements.CancelButton.Content = 'Cancel Inventory'
+            $uiElements.CancelButton.IsEnabled = $true
+            $uiElements.InstalledDriverListPanel.Children.Clear()
 
-        $powershell = [System.Management.Automation.PowerShell]::Create()
-        $powershell.Runspace = $runspace
-    
-        # Store references for cancellation
-        $script:ApplicationState.SetCurrentPowerShell($powershell)
-        $script:ApplicationState.SetCurrentRunspace($runspace)
+            $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+            $runspace.Open()
+            $runspace.SessionStateProxy.SetVariable('WimFilePath', $wimValidation.ResolvedPath)
+            $runspace.SessionStateProxy.SetVariable('MountDirectory', $mountPath)
+            $runspace.SessionStateProxy.SetVariable('WimIndex', $selectedIndex)
+            $runspace.SessionStateProxy.SetVariable('MessageQueue', $messageQueue)
+            $runspace.SessionStateProxy.SetVariable('ActiveProcesses', $activeProcesses)
+            $runspace.SessionStateProxy.SetVariable('DismPath', (Get-TrustedDismPath))
+            $runspace.SessionStateProxy.SetVariable('ConvertNativeArgument', (Get-Command -Name 'ConvertTo-NativeArgument').ScriptBlock)
 
-        # FIXED Real-time Inventory Script
-        $inventoryScript = {
-            $result = @{ Success = $false; Drivers = @(); ErrorMessage = ""; Progress = 0 }
-    
-            try {
-                # Create event for progress updates
-                $progressEvent = "InventoryProgress"
-        
-                function Send-Progress {
-                    param($Percentage, $Status, $Detail = "")
-                    Register-EngineEvent -SourceIdentifier $progressEvent -MessageData @{
-                        Progress = $Percentage
+            $powershell = [System.Management.Automation.PowerShell]::Create()
+            $powershell.Runspace = $runspace
+            $applicationState.SetCurrentPowerShell($powershell)
+            $applicationState.SetCurrentRunspace($runspace)
+
+            $inventoryScript = {
+                function Send-InventoryMessage {
+                    param([string]$Message, [string]$Level = 'Info', [int]$Progress = 0, [string]$Status = '')
+                    $MessageQueue.Enqueue([PSCustomObject]@{
+                        Message  = $Message
+                        Level    = $Level
+                        Progress = $Progress
                         Status   = $Status  
-                        Detail   = $Detail
-                    } | Out-Null
+                    })
                 }
         
-                function Send-Log {
-                    param($Message, $Level = "Info")
-                    Register-EngineEvent -SourceIdentifier "InventoryLog" -MessageData @{
-                        Message = $Message
-                        Level   = $Level
-                    } | Out-Null
-                }
-
-                # Helper function to execute DISM with proper arguments
-                function Invoke-DismCommand {
-                    param(
-                        [string]$Operation,
-                        [hashtable]$Arguments,
-                        [int]$TimeoutMs = 300000
-                    )
-            
-                    # Build argument list properly
-                    $argumentList = [System.Collections.Generic.List[string]]::new()
-                    $argumentList.Add($Operation)
-            
-                    foreach ($key in $Arguments.Keys) {
-                        $value = $Arguments[$key]
-                
-                        switch ($key) {
-                            'ImageFile' { $argumentList.Add("/ImageFile:`"$value`"") }
-                            'WimFile' { $argumentList.Add("/WimFile:`"$value`"") }
-                            'Image' { $argumentList.Add("/Image:`"$value`"") }
-                            'MountDir' { $argumentList.Add("/MountDir:`"$value`"") }
-                            'Index' { $argumentList.Add("/Index:$value") }
-                            'All' { if ([bool]$value) { $argumentList.Add("/All") } }
-                            'Commit' { if ([bool]$value) { $argumentList.Add("/Commit") } }
-                            'Discard' { if ([bool]$value) { $argumentList.Add("/Discard") } }
-                        }
-                    }
-            
+                function New-InventoryProcessInfo {
+                    param([string]$Operation, [string]$ArgumentString = '')
                     $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
-                    $processInfo.FileName = "dism.exe"
-                    $processInfo.Arguments = $argumentList -join ' '
+                    $processInfo.FileName = $DismPath
+                    $processInfo.Arguments = "/English $Operation"
+                    if (-not [string]::IsNullOrWhiteSpace($ArgumentString)) {
+                        $processInfo.Arguments += " $ArgumentString"
+                    }
                     $processInfo.UseShellExecute = $false
                     $processInfo.CreateNoWindow = $true
                     $processInfo.RedirectStandardOutput = $true
                     $processInfo.RedirectStandardError = $true
+                    return $processInfo
+                }
             
-                    $process = [System.Diagnostics.Process]::Start($processInfo)
-            
-                    $outputTask = $process.StandardOutput.ReadToEndAsync()
-                    $errorTask = $process.StandardError.ReadToEndAsync()
-
-                    if (-not $process.WaitForExit($TimeoutMs)) {
-                        try {
+                function Invoke-InventoryDism {
+                    param([System.Diagnostics.ProcessStartInfo]$ProcessInfo, [int]$TimeoutMs = 300000)
+                    $process = [System.Diagnostics.Process]::Start($ProcessInfo)
+                    $processKey = [Guid]::NewGuid().ToString('N')
+                    $ActiveProcesses[$processKey] = $process
+                    try {
+                        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                        $stderrTask = $process.StandardError.ReadToEndAsync()
+                        if (-not $process.WaitForExit($TimeoutMs)) {
                             $process.Kill()
-                            $process.WaitForExit(5000)
+                            $process.WaitForExit(5000) | Out-Null
+                            throw "DISM operation timed out after $($TimeoutMs / 1000) seconds"
                         }
-                        catch { }
-                        throw "Operation timed out after $($TimeoutMs / 1000) seconds"
+                        if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
+                            throw 'DISM output streams did not close within the timeout.'
+                        }
+                        return @{
+                            Success  = ($process.ExitCode -eq 0)
+                            ExitCode = $process.ExitCode
+                            Output   = $stdoutTask.Result
+                            Error    = $stderrTask.Result
+                        }
                     }
-            
-                    $output = $outputTask.Result
-                    $errorOutput = $errorTask.Result
-                    $exitCode = $process.ExitCode
-                    $process.Dispose()
-            
-                    return @{
-                        Success  = ($exitCode -eq 0)
-                        ExitCode = $exitCode
-                        Output   = $output
-                        Error    = $errorOutput
+                    finally {
+                        $null = $ActiveProcesses.TryRemove($processKey, [ref]$null)
+                        $process.Dispose()
                     }
                 }
 
-                Send-Log "Starting driver inventory operation..." "Info"
-                Send-Progress 5 "Preparing mount directory..."
-
-                # Clear mount directory
-                Send-Log "Clearing mount directory: $MountDirectory" "Info"
-                if ([System.IO.Directory]::Exists($MountDirectory)) {
-                    Send-Log "Cleaning up existing mount directory..." "Info"
-            
-                    # Try unmount first
-                    try {
-                        $unmountResult = Invoke-DismCommand -Operation "/Unmount-Image" -Arguments @{
-                            MountDir = $MountDirectory
-                            Discard  = $true
-                        } -TimeoutMs 60000
-                
-                        if ($unmountResult.Success) {
-                            Send-Log "Successfully unmounted existing mount." "Success"
-                        }
-                        else {
-                            Send-Log "Unmount attempt completed (may not have been mounted)." "Info"
-                        }
-                    }
-                    catch {
-                        Send-Log "Unmount attempt: $($_.Exception.Message)" "Info"
-                    }
-            
-                    # Global cleanup
-                    try {
-                        Send-Log "Running global DISM cleanup..." "Info"
-                        $cleanupProcess = Start-Process "dism.exe" -ArgumentList "/Cleanup-Mountpoints" -Wait -PassThru -NoNewWindow
-                        Send-Log "Global cleanup completed with exit code: $($cleanupProcess.ExitCode)" "Info"
-                    }
-                    catch {
-                        Send-Log "Global cleanup error: $($_.Exception.Message)" "Warning"
-                    }
-            
-                    # Remove directory
-                    if ([System.IO.Directory]::Exists($MountDirectory)) {
-                        Start-Sleep -Seconds 2
-                        try {
-                            Remove-Item -Path $MountDirectory -Recurse -Force -ErrorAction Stop
-                            Send-Log "Mount directory removed successfully." "Success"
-                        }
-                        catch {
-                            Send-Log "Could not remove mount directory: $($_.Exception.Message)" "Warning"
-                        }
-                    }
-                }
-
-                # Create fresh mount directory
-                [System.IO.Directory]::CreateDirectory($MountDirectory) | Out-Null
-                Send-Log "Created clean mount directory." "Success"
-                Send-Progress 10 "Mount directory prepared"
-
-                # Mount WIM with proper error handling
-                Send-Progress 15 "Mounting WIM index $WimIndex (this will take several minutes for large files)..."
-                Send-Log "Starting DISM mount operation for index $WimIndex..." "Info"
-                Send-Log "Expected time: 5-25 minutes depending on WIM size ($WimSizeGB GB)" "Info"
-        
-                $mountResult = Invoke-DismCommand -Operation "/Mount-Image" -Arguments @{
-                    ImageFile = $WimFilePath
-                    Index     = $WimIndex
-                    MountDir  = $MountDirectory
-                } -TimeoutMs 1800000  # 30 minutes
-        
-                if (-not $mountResult.Success) {
-                    Send-Log "Mount failed with exit code: $($mountResult.ExitCode)" "Error"
-                    if ($mountResult.Error) {
-                        Send-Log "DISM Error: $($mountResult.Error)" "Error"
-                    }
-                    throw "Failed to mount WIM index $WimIndex"
-                }
-        
-                Send-Log "Mount completed successfully" "Success"
-        
-                # Verify mount
-                $windowsPath = [System.IO.Path]::Combine($MountDirectory, "Windows")
-                if (-not [System.IO.Directory]::Exists($windowsPath)) {
-                    throw "Mount verification failed - Windows directory not found in mounted image"
-                }
-                Send-Log "Mount verification successful." "Success"
-        
-                # Start driver inventory with FIXED command
-                Send-Progress 80 "Scanning for installed drivers..."
-                Send-Log "Starting driver inventory scan..." "Info"
-        
-                # Use proper /Get-Drivers syntax
-                $driverResult = Invoke-DismCommand -Operation "/Get-Drivers" -Arguments @{
-                    Image = $MountDirectory
-                } -TimeoutMs 300000  # 5 minutes
-        
-                if (-not $driverResult.Success) {
-                    Send-Log "Driver scan failed with exit code: $($driverResult.ExitCode)" "Error"
-                    Send-Log "DISM Error: $($driverResult.Error)" "Error"
-                    throw "Driver inventory failed"
-                }
-        
-                Send-Progress 90 "Parsing driver information..."
-                Send-Log "Driver scan completed, parsing results..." "Success"
-        
-                # Parse driver output
-                $drivers = [System.Collections.Generic.List[object]]::new()
-                $driverOutput = $driverResult.Output
-        
-                if ([string]::IsNullOrWhiteSpace($driverOutput)) {
-                    Send-Log "No driver output received from DISM" "Warning"
-                }
-                else {
-                    # Parse the output
-                    $lines = $driverOutput -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-            
-                    $currentDriver = $null
-                    foreach ($line in $lines) {
-                        if ($line -match "Published Name\s*:\s*(.+)") {
-                            if ($currentDriver) {
-                                $drivers.Add($currentDriver)
-                            }
-                            $currentDriver = @{
-                                PublishedName    = $matches[1].Trim()
-                                OriginalFileName = "Unknown"
-                                ClassName        = "Unknown"
-                                ProviderName     = "Unknown"
-                                DriverDate       = "Unknown"
-                                DriverVersion    = "Unknown"
-                                InboxDriver      = $false
-                            }
-                        }
-                        elseif ($currentDriver) {
-                            if ($line -match "Original File Name\s*:\s*(.+)") {
-                                $currentDriver.OriginalFileName = $matches[1].Trim()
-                            }
-                            elseif ($line -match "Class Name\s*:\s*(.+)") {
-                                $currentDriver.ClassName = $matches[1].Trim()
-                            }
-                            elseif ($line -match "Provider Name\s*:\s*(.+)") {
-                                $currentDriver.ProviderName = $matches[1].Trim()
-                            }
-                            elseif ($line -match "Date\s*:\s*(.+)") {
-                                $currentDriver.DriverDate = $matches[1].Trim()
-                            }
-                            elseif ($line -match "Version\s*:\s*(.+)") {
-                                $currentDriver.DriverVersion = $matches[1].Trim()
-                            }
-                            elseif ($line -match "Inbox\s*:\s*(.+)") {
-                                $currentDriver.InboxDriver = ($matches[1].Trim() -eq "Yes")
-                            }
-                        }
-                    }
-            
-                    # Add the last driver if exists
-                    if ($currentDriver) {
-                        $drivers.Add($currentDriver)
-                    }
-            
-                    # Convert to PSObject
-                    $result.Drivers = $drivers | ForEach-Object { New-Object PSObject -Property $_ }
-                }
-        
-                $result.Success = $true
-                Send-Log "Found $($drivers.Count) installed drivers" "Success"
-                Send-Progress 95 "Preparing to unmount..."
-        
-            }
-            catch {
-                $result.ErrorMessage = $_.Exception.Message
-                Send-Log "Error during driver inventory: $($_.Exception.Message)" "Error"
-            }
-            finally {
-                # Always try to unmount
-                Send-Progress 98 "Unmounting WIM image..."
-                Send-Log "Starting unmount operation..." "Info"
-        
+                $result = @{ Success = $false; Drivers = @(); ErrorMessage = '' }
+                $mountAttempted = $false
                 try {
-                    # Use the helper function for unmount
-                    $unmountResult = Invoke-DismCommand -Operation "/Unmount-Image" -Arguments @{
-                        MountDir = $MountDirectory
-                        Discard  = $true
-                    } -TimeoutMs 180000
+                    Send-InventoryMessage -Message 'Preparing driver inventory...' -Progress 5 -Status 'Preparing inventory'
+                    $quotedWim = & $ConvertNativeArgument -Value $WimFilePath
+                    $quotedMount = & $ConvertNativeArgument -Value $MountDirectory
+                    $mountInfo = New-InventoryProcessInfo -Operation '/Mount-Image' -ArgumentString "/ImageFile:$quotedWim /Index:$WimIndex /MountDir:$quotedMount"
+                    $mountAttempted = $true
+                    Send-InventoryMessage -Message 'Mounting WIM image...' -Progress 15 -Status 'Mounting image'
+                    $mountResult = Invoke-InventoryDism -ProcessInfo $mountInfo -TimeoutMs 1800000
+                    if (-not $mountResult.Success) {
+                        throw "Mount failed: $($mountResult.Error)"
+                    }
+
+                    if (-not [System.IO.Directory]::Exists((Join-Path $MountDirectory 'Windows'))) {
+                        throw 'Mount verification failed: Windows directory was not found.'
+                    }
             
-                    if ($unmountResult.Success) {
-                        Send-Log "Image unmounted successfully." "Success"
+                    Send-InventoryMessage -Message 'Reading installed drivers...' -Progress 70 -Status 'Inventorying drivers'
+                    $driverInfo = New-InventoryProcessInfo -Operation '/Get-Drivers' -ArgumentString "/Image:$quotedMount /All /Format:List"
+                    $driverResult = Invoke-InventoryDism -ProcessInfo $driverInfo -TimeoutMs 600000
+                    if (-not $driverResult.Success) {
+                        throw "Driver inventory failed: $($driverResult.Error)"
                     }
-                    else {
-                        Send-Log "Unmount completed with exit code: $($unmountResult.ExitCode)" "Warning"
+
+                    $drivers = [System.Collections.Generic.List[object]]::new()
+                    $currentDriver = $null
+                    foreach ($line in ($driverResult.Output -split "`n")) {
+                        $trimmed = $line.Trim()
+                        if ($trimmed -match '^Published Name\s*:\s*(.+)$') {
+                            if ($null -ne $currentDriver) { $drivers.Add($currentDriver) }
+                            $currentDriver = @{
+                                PublishedName = $matches[1].Trim()
+                                OriginalFileName = 'Unknown'
+                                ClassName = 'Unknown'
+                                ProviderName = 'Unknown'
+                                DriverDate = 'Unknown'
+                                DriverVersion = 'Unknown'
+                                InboxDriver = $false
+                                IsBootCritical = $true
+                            }
+                        }
+                        elseif ($null -ne $currentDriver) {
+                            if ($trimmed -match '^Original File Name\s*:\s*(.+)$') { $currentDriver.OriginalFileName = $matches[1].Trim() }
+                            elseif ($trimmed -match '^Class Name\s*:\s*(.+)$') { $currentDriver.ClassName = $matches[1].Trim() }
+                            elseif ($trimmed -match '^Provider Name\s*:\s*(.+)$') { $currentDriver.ProviderName = $matches[1].Trim() }
+                            elseif ($trimmed -match '^Date\s*:\s*(.+)$') { $currentDriver.DriverDate = $matches[1].Trim() }
+                            elseif ($trimmed -match '^Version\s*:\s*(.+)$') { $currentDriver.DriverVersion = $matches[1].Trim() }
+                            elseif ($trimmed -match '^Inbox\s*:\s*(Yes|No)$') { $currentDriver.InboxDriver = ($matches[1] -eq 'Yes') }
+                        }
                     }
+                    if ($null -ne $currentDriver) { $drivers.Add($currentDriver) }
+
+                    $driverNumber = 0
+                    foreach ($driver in $drivers) {
+                        $driverNumber++
+                        Send-InventoryMessage -Message "Reading details for $($driver.PublishedName)..." -Progress (70 + [math]::Round(20 * $driverNumber / [math]::Max(1, $drivers.Count))) -Status 'Reading driver details'
+                        $quotedPublishedName = & $ConvertNativeArgument -Value ([string]$driver.PublishedName)
+                        $detailInfo = New-InventoryProcessInfo -Operation '/Get-DriverInfo' -ArgumentString "/Image:$quotedMount /Driver:$quotedPublishedName"
+                        $detailResult = Invoke-InventoryDism -ProcessInfo $detailInfo -TimeoutMs 60000
+                        if ($detailResult.Success -and $detailResult.Output -match 'Boot Critical\s*:\s*(Yes|No)') {
+                            $driver.IsBootCritical = ($matches[1] -eq 'Yes')
+                        }
+                    }
+
+                    $result.Drivers = @($drivers.ToArray())
+                    $result.Success = $true
+                    Send-InventoryMessage -Message "Found $($drivers.Count) installed drivers." -Level 'Success' -Progress 95 -Status 'Inventory complete'
                 }
                 catch {
-                    Send-Log "Error during unmount: $($_.Exception.Message)" "Error"
+                    $result.ErrorMessage = $_.Exception.Message
+                    Send-InventoryMessage -Message $result.ErrorMessage -Level 'Error'
                 }
-        
-                Send-Progress 100 "Operation completed"
+                finally {
+                    if ($mountAttempted) {
+                        Send-InventoryMessage -Message 'Discarding inventory mount...' -Progress 98 -Status 'Unmounting image'
+                        $discardInfo = New-InventoryProcessInfo -Operation '/Unmount-Image' -ArgumentString "/MountDir:$quotedMount /Discard"
+                        try {
+                            $discardResult = Invoke-InventoryDism -ProcessInfo $discardInfo -TimeoutMs 180000
+                            if (-not $discardResult.Success -and $result.Success) {
+                                $result.Success = $false
+                                $result.ErrorMessage = "Inventory completed but unmount failed: $($discardResult.Error)"
+                            }
+                        }
+                        catch {
+                            if ($result.Success) {
+                                $result.Success = $false
+                                $result.ErrorMessage = "Inventory completed but unmount failed: $($_.Exception.Message)"
+                            }
+                        }
+                    }
+                    Send-InventoryMessage -Message 'Inventory operation finished.' -Progress 100 -Status 'Finished'
+                }
+
+                return $result
             }
-    
-            return $result
-        }
-    
-        $powershell.AddScript($inventoryScript)
-    
-        # Start Background Operation
-        $asyncResult = $powershell.BeginInvoke()
-        $script:ApplicationState.SetBackgroundResult($asyncResult)
-    
-        # Set up Event Monitoring
-        $progressSubscription = Register-EngineEvent -SourceIdentifier "InventoryProgress" -Action {
-            $eventData = $Event.MessageData
-            Update-ApplicationProgress $eventData.Progress $eventData.Status
-            if (-not [string]::IsNullOrWhiteSpace($eventData.Detail)) {
-                Write-ApplicationLog $eventData.Detail ([LogLevel]::Info)
-            }
-        }
-    
-        $logSubscription = Register-EngineEvent -SourceIdentifier "InventoryLog" -Action {
-            $eventData = $Event.MessageData
-            Write-ApplicationLog $eventData.Message $eventData.Level
-        }
-    
-        # Monitor Operation with UI Updates
-        $monitorTimer = [System.Windows.Threading.DispatcherTimer]::new()
-        $monitorTimer.Interval = [TimeSpan]::FromMilliseconds(1000)
-    
-        # This is the corrected monitoring timer section (starting around line 400)
-        $monitorTimer.Add_Tick({
+
+            $powershell.AddScript($inventoryScript)
+            $asyncResult = $powershell.BeginInvoke()
+            $applicationState.SetBackgroundResult($asyncResult)
+
+            $monitorTimer = [System.Windows.Threading.DispatcherTimer]::new()
+            $monitorTimer.Interval = [TimeSpan]::FromMilliseconds(750)
+            $tickHandler = {
+                $message = Take-OperationMessage -Queue $messageQueue
+                while ($null -ne $message) {
+                    if ($message.Progress -gt 0) {
+                        Update-ApplicationProgress $message.Progress $message.Status
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($message.Message)) {
+                        Write-ApplicationLog $message.Message ([LogLevel]$message.Level)
+                    }
+                    $message = Take-OperationMessage -Queue $messageQueue
+                }
+
                 if ($asyncResult.IsCompleted) {
                     $monitorTimer.Stop()
-        
                     try {
-                        # Get results
                         $jobResult = $powershell.EndInvoke($asyncResult)
-            
                         if ($jobResult.Success) {
-                            Write-ApplicationLog "Driver inventory completed successfully. Found $($jobResult.Drivers.Count) drivers." ([LogLevel]::Success)
-                            Update-ApplicationProgress 100 "Inventory complete. Found $($jobResult.Drivers.Count) drivers."
-                
-                            # Update application state and UI
-                            $script:ApplicationState.InstalledDrivers.Clear()
+                            $applicationState.InstalledDrivers.Clear()
                             foreach ($driver in $jobResult.Drivers) {
-                                # Convert PSObject to InstalledDriverInfo properly
-                                $driverProperties = @{}
-                                foreach ($prop in $driver.psobject.Properties) {
-                                    $driverProperties[$prop.Name] = $prop.Value
-                                }
-                                $driverInfo = [InstalledDriverInfo]::new($driverProperties)
-                                [void]$script:ApplicationState.InstalledDrivers.Add($driverInfo)
+                                [void]$applicationState.InstalledDrivers.Add([InstalledDriverInfo]::new($driver))
                             }
-                            Update-InstalledDriverUI -Drivers $script:ApplicationState.InstalledDrivers.ToArray()
+                            Update-InstalledDriverUI -Drivers $applicationState.InstalledDrivers.ToArray()
+                            Write-ApplicationLog "Driver inventory completed. Found $($jobResult.Drivers.Count) drivers." ([LogLevel]::Success)
                         }
                         else {
                             Write-ApplicationLog "Driver inventory failed: $($jobResult.ErrorMessage)" ([LogLevel]::Error)
-                            Update-ApplicationProgress 0 "Inventory failed."
-                            [System.Windows.MessageBox]::Show("Driver inventory failed: $($jobResult.ErrorMessage)", "Inventory Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                            [System.Windows.MessageBox]::Show($jobResult.ErrorMessage, 'Inventory Error', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
                         }
                     }
                     catch {
-                        Write-ApplicationLog "Error processing inventory results: $($_.Exception.Message)" ([LogLevel]::Error)
-                        Update-ApplicationProgress 0 "Inventory failed with exception."
-                        [System.Windows.MessageBox]::Show("Error processing inventory results: $($_.Exception.Message)", "Processing Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                        Write-ApplicationLog "Inventory result processing failed: $($_.Exception.Message)" ([LogLevel]::Error)
                     }
                     finally {
-                        # Cleanup
-                        try {
-                            if ($progressSubscription) {
-                                Unregister-Event -SubscriptionId $progressSubscription.Id -ErrorAction SilentlyContinue
+                        foreach ($activeProcess in @($activeProcesses.Values)) {
+                            try {
+                                if (-not $activeProcess.HasExited) { $activeProcess.Kill() }
                             }
-                            if ($logSubscription) {
-                                Unregister-Event -SubscriptionId $logSubscription.Id -ErrorAction SilentlyContinue
-                            }
-                            $powershell.Dispose()
-                            $runspace.Close()
-                            $runspace.Dispose()
+                            catch { }
                         }
-                        catch { 
-                            Write-Verbose "Cleanup error: $($_.Exception.Message)"
+                        try { $powershell.Dispose() } catch { }
+                        try { $runspace.Close() } catch { }
+                        try { $runspace.Dispose() } catch { }
+                        $applicationState.SetCurrentPowerShell($null)
+                        $applicationState.SetCurrentRunspace($null)
+                        $applicationState.SetBackgroundResult($null)
+                        $journalCompleted = $false
+                        try { $journalCompleted = Complete-OperationJournal -JournalPath $journalPath -MountPath $mountPath } catch { }
+                        if (-not $journalCompleted) {
+                            Write-ApplicationLog 'Inventory cleanup was incomplete; the recovery journal was retained.' ([LogLevel]::Error)
                         }
-            
-                        # Reset UI
+                        $applicationState.SetCurrentMountPath($null)
+                        $applicationState.SetActiveProcesses($null)
+                        $applicationState.SetCurrentInventoryIndex(0)
                         $uiElements.MainProgressBar.Value = 0
                         $uiElements.InventoryDriversButton.IsEnabled = $true
                         $uiElements.BrowseWimButton.IsEnabled = $true
+                        $uiElements.BrowseMountButton.IsEnabled = $true
+                        $uiElements.ScanDriversButton.IsEnabled = $true
+                        $uiElements.RemoveDriversButton.IsEnabled = $true
+                        $uiElements.ExportDriversButton.IsEnabled = $true
                         $uiElements.StartButton.IsEnabled = $true
-                        $uiElements.InventoryDriversButton.Content = "Inventory Drivers"
-                        $uiElements.CancelButton.Content = "Cancel"
-                        $script:ApplicationState.SetCurrentState('Idle')
-                        $script:ApplicationState.SetCurrentPowerShell($null)
-                        $script:ApplicationState.SetCurrentRunspace($null)
-                        $script:ApplicationState.SetBackgroundResult($null)
+                        $uiElements.InventoryDriversButton.Content = 'Inventory Drivers'
+                        $uiElements.CancelButton.Content = 'Cancel'
+                        $applicationState.SetCurrentState('Idle')
                     }
                 }
-                elseif ($script:ApplicationState.GetCurrentState() -eq 'Cancelling') {
-                    # Handle cancellation
+                elseif ($applicationState.GetCurrentState() -eq 'Cancelling') {
                     $monitorTimer.Stop()
-                    Write-ApplicationLog "Cancelling driver inventory operation..." ([LogLevel]::Warning)
-        
-                    try {
-                        $powershell.Stop()
-                        Start-Sleep -Seconds 2
-            
-                        # Force cleanup
+                    foreach ($activeProcess in @($activeProcesses.Values)) {
                         try {
-                            Start-Process "dism.exe" -ArgumentList "/Cleanup-Mountpoints" -Wait -NoNewWindow -WindowStyle Hidden
-                        }
-                        catch { 
-                            Write-Verbose "Cleanup error: $($_.Exception.Message)"
-                        }
-            
-                        Write-ApplicationLog "Driver inventory operation cancelled by user." ([LogLevel]::Warning)
-                    }
-                    catch {
-                        Write-ApplicationLog "Error during cancellation: $($_.Exception.Message)" ([LogLevel]::Error)
-                    }
-                    finally {
-                        # Cleanup
-                        try {
-                            if ($progressSubscription) {
-                                Unregister-Event -SubscriptionId $progressSubscription.Id -ErrorAction SilentlyContinue
+                            if (-not $activeProcess.HasExited) {
+                                $activeProcess.Kill()
+                                $activeProcess.WaitForExit(5000) | Out-Null
                             }
-                            if ($logSubscription) {
-                                Unregister-Event -SubscriptionId $logSubscription.Id -ErrorAction SilentlyContinue
-                            }
-                            $powershell.Dispose()
-                            $runspace.Close()
-                            $runspace.Dispose()
                         }
-                        catch { 
-                            Write-Verbose "Cleanup error: $($_.Exception.Message)"
-                        }
-            
-                        # Reset UI
-                        Update-ApplicationProgress 0 "Operation cancelled"
-                        $uiElements.MainProgressBar.Value = 0
-                        $uiElements.InventoryDriversButton.IsEnabled = $true
-                        $uiElements.BrowseWimButton.IsEnabled = $true
-                        $uiElements.StartButton.IsEnabled = $true
-                        $uiElements.InventoryDriversButton.Content = "Inventory Drivers"
-                        $uiElements.CancelButton.Content = "Cancel"
-                        $script:ApplicationState.SetCurrentState('Idle')
-                        $script:ApplicationState.SetCurrentPowerShell($null)
-                        $script:ApplicationState.SetCurrentRunspace($null)
-                        $script:ApplicationState.SetBackgroundResult($null)
+                        catch { }
+                    }
+                    try { $powershell.Stop() } catch { }
+                    try { $asyncResult.AsyncWaitHandle.WaitOne(10000) | Out-Null } catch { }
+                    $cleanupSucceeded = Complete-OperationJournal -JournalPath $journalPath -MountPath $mountPath
+                    try { $powershell.Dispose() } catch { }
+                    try { $runspace.Close() } catch { }
+                    try { $runspace.Dispose() } catch { }
+                    $applicationState.SetCurrentPowerShell($null)
+                    $applicationState.SetCurrentRunspace($null)
+                    $applicationState.SetBackgroundResult($null)
+                    $applicationState.SetCurrentMountPath($null)
+                    $applicationState.SetActiveProcesses($null)
+                    $applicationState.SetCurrentInventoryIndex(0)
+                    $uiElements.InventoryDriversButton.IsEnabled = $true
+                    $uiElements.BrowseWimButton.IsEnabled = $true
+                    $uiElements.BrowseMountButton.IsEnabled = $true
+                    $uiElements.ScanDriversButton.IsEnabled = $true
+                    $uiElements.RemoveDriversButton.IsEnabled = $true
+                    $uiElements.ExportDriversButton.IsEnabled = $true
+                    $uiElements.StartButton.IsEnabled = $true
+                    $uiElements.InventoryDriversButton.Content = 'Inventory Drivers'
+                    $uiElements.CancelButton.Content = 'Cancel'
+                    $uiElements.CancelButton.IsEnabled = $true
+                    $applicationState.SetCurrentState([ProcessingState]::Completed)
+                    Update-ApplicationProgress 0 'Inventory cancelled.'
+                    if (-not $cleanupSucceeded) {
+                        Write-ApplicationLog 'Inventory was cancelled, but targeted mount cleanup failed. Manual cleanup may be required.' ([LogLevel]::Error)
                     }
                 }
-            })
-
-        $monitorTimer.Start()
+            }
+            $monitorTimer.Add_Tick($tickHandler.GetNewClosure())
+            $monitorTimer.Start()
+            Write-ApplicationLog "Starting driver inventory for index $selectedIndex..." ([LogLevel]::Info)
+        }
+        catch {
+            if ($null -ne $powershell) { try { $powershell.Dispose() } catch { } }
+            if ($null -ne $runspace) {
+                try { $runspace.Close(); $runspace.Dispose() } catch { }
+            }
+            if ($null -ne $mountPath) { Complete-OperationJournal -JournalPath $journalPath -MountPath $mountPath | Out-Null }
+            $applicationState.SetCurrentMountPath($null)
+            $applicationState.SetActiveProcesses($null)
+            $applicationState.SetCurrentInventoryIndex(0)
+            $applicationState.SetCurrentPowerShell($null)
+            $applicationState.SetCurrentRunspace($null)
+            $applicationState.SetBackgroundResult($null)
+            $applicationState.SetCurrentState('Idle')
+            $uiElements.InventoryDriversButton.IsEnabled = $true
+            $uiElements.BrowseWimButton.IsEnabled = $true
+            $uiElements.BrowseMountButton.IsEnabled = $true
+            $uiElements.ScanDriversButton.IsEnabled = $true
+            $uiElements.RemoveDriversButton.IsEnabled = $true
+            $uiElements.ExportDriversButton.IsEnabled = $true
+            $uiElements.StartButton.IsEnabled = $true
+            $uiElements.InventoryDriversButton.Content = 'Inventory Drivers'
+            $uiElements.CancelButton.Content = 'Cancel'
+            [System.Windows.MessageBox]::Show("Could not start driver inventory: $($_.Exception.Message)", 'Inventory Error', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+        }
     })
 
 # Enhanced Driver Removal Handler
@@ -6168,113 +6222,84 @@ $uiElements.RemoveDriversButton.Add_Click({
         if ($script:ApplicationState.IsProcessing()) { return }
 
         try {
-            Write-Verbose "User initiated driver removal operation"
-        
+            $applicationState = $script:ApplicationState
+            $wimValidation = Test-WimFileValidation -WimPath $uiElements.WimFileTextBox.Text
+            $mountValidation = Test-SecurePath -Path $uiElements.MountDirTextBox.Text
             $mountPrereqValidation = Test-MountPathPrerequisites -MountPath $uiElements.MountDirTextBox.Text
-            if (-not $mountPrereqValidation.IsValid) {
-                [System.Windows.MessageBox]::Show(
-                    "The selected mount directory does not meet the requirements for DISM operations:`n`n$($mountPrereqValidation.ErrorMessage)",
-                    "Invalid Mount Directory",
-                    [System.Windows.MessageBoxButton]::OK,
-                    [System.Windows.MessageBoxImage]::Error
-                )
-                Write-ApplicationLog "Mount path prerequisite check failed: $($mountPrereqValidation.ErrorMessage)" ([LogLevel]::Error)
+            if (-not $wimValidation.IsValid -or -not $mountValidation.IsValid -or -not $mountPrereqValidation.IsValid) {
+                [System.Windows.MessageBox]::Show('Validate the WIM file and mount parent directory before removing drivers.', 'Validation Error', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                return
+            }
+
+            $selectedIndex = $script:ApplicationState.GetCurrentInventoryIndex()
+            if ($selectedIndex -le 0) {
+                [System.Windows.MessageBox]::Show('Inventory a WIM index before removing drivers.', 'No Inventory', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
                 return
             }
 
             $selectedDrivers = Get-SelectedInstalledDrivers
             if ($selectedDrivers.Count -eq 0) {
-                [System.Windows.MessageBox]::Show(
-                    "Please select at least one driver to remove.", 
-                    "No Drivers Selected", 
-                    [System.Windows.MessageBoxButton]::OK, 
-                    [System.Windows.MessageBoxImage]::Information
-                )
+                [System.Windows.MessageBox]::Show('Select at least one driver to remove.', 'No Drivers Selected', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
                 return
             }
         
-            $confirmMessage = "Are you sure you want to remove $($selectedDrivers.Count) driver(s)? This action cannot be undone and may affect system stability."
+            $confirm = [System.Windows.MessageBox]::Show(
+                "Remove $($selectedDrivers.Count) selected driver(s) from index $selectedIndex? This cannot be undone.",
+                'Confirm Driver Removal',
+                [System.Windows.MessageBoxButton]::YesNo,
+                [System.Windows.MessageBoxImage]::Warning
+            )
+            if ($confirm -eq [System.Windows.MessageBoxResult]::No) { return }
         
-            $result = [System.Windows.MessageBox]::Show($confirmMessage, "Confirm Driver Removal", [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
-            if ($result -eq [System.Windows.MessageBoxResult]::No) { return }
-        
+            $mountPath = New-ApplicationMountDirectory -ParentPath $mountValidation.ResolvedPath
             $uiElements.RemoveDriversButton.IsEnabled = $false
             $uiElements.ExportDriversButton.IsEnabled = $false
-            $uiElements.ProgressTextBlock.Text = "Removing selected drivers..."
-            $uiElements.MainProgressBar.IsIndeterminate = $true
-            $script:ApplicationState.SetCurrentState('RemovingDrivers')
-        
-            Write-ApplicationLog "Starting driver removal for $($selectedDrivers.Count) drivers" ([LogLevel]::Info)
-        
-            $removalStartTime = Get-Date
-            $indexes = Get-WimIndexes -WimFilePath $uiElements.WimFileTextBox.Text
-            $mountPath = $uiElements.MountDirTextBox.Text
-        
-            $totalSuccessfulRemovals = 0
-            $totalFailedRemovals = 0
-        
-            foreach ($index in $indexes) {
-                try {
-                    Write-ApplicationLog "Processing driver removal for index $index..." ([LogLevel]::Info)
-                    Update-ApplicationProgress (($index / $indexes.Count) * 90) "Removing drivers from index $index..."
-                
-                    if (-not (Clear-MountDirectory -MountPath $mountPath)) {
-                        Write-ApplicationLog "Failed to prepare mount directory for index $index" ([LogLevel]::Warning)
-                        continue
-                    }
-                
-                    $mountArgs = @{ ImageFile = $uiElements.WimFileTextBox.Text; Index = $index; MountDir = $mountPath }
-                
-                    $mountResult = Invoke-EnhancedDismOperation -Operation "/Mount-Image" -Arguments $mountArgs -TimeoutMs 1200000
-                    if (-not $mountResult.Success) {
-                        Write-ApplicationLog "Failed to mount index $index for driver removal" ([LogLevel]::Warning)
-                        continue
-                    }
-                
-                    Start-Sleep -Milliseconds 3000
-                
-                    $removalResult = Remove-DriversFromMountedImage -MountPath $mountPath -DriversToRemove $selectedDrivers -Force:$false
-                
-                    $totalSuccessfulRemovals += $removalResult.SuccessfulRemovals
-                    $totalFailedRemovals += $removalResult.FailedRemovals
+            $uiElements.StartButton.IsEnabled = $false
+            $uiElements.ScanDriversButton.IsEnabled = $false
+            $uiElements.InventoryDriversButton.IsEnabled = $false
+            $uiElements.BrowseWimButton.IsEnabled = $false
+            $uiElements.BrowseMountButton.IsEnabled = $false
+            $uiElements.CancelButton.IsEnabled = $true
+            $uiElements.CancelButton.Content = 'Cancel Removal'
 
-                    # --- CORRECTED UNMOUNT CALL ---
-                    $unmountArgs = @{ MountDir = $mountPath; Commit = $true }
-                    $unmountResult = Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $unmountArgs -TimeoutMs 180000
-                
-                    if ($unmountResult.Success) {
-                        Write-ApplicationLog "Index ${index} successfully processed. Removed $($removalResult.SuccessfulRemovals) drivers." ([LogLevel]::Success)
-                    }
-                    else {
-                        Write-ApplicationLog "Index ${index} failed to commit changes." ([LogLevel]::Error)
-                    }
+            $onCompleted = {
+                param($Result)
+                $message = if ($Result.Success) { 'Driver removal completed.' } else { 'Driver removal failed.' }
+                $message += "`n$($Result.Message)"
+                [System.Windows.MessageBox]::Show($message, 'Driver Removal', [System.Windows.MessageBoxButton]::OK, $(if ($Result.Success) { [System.Windows.MessageBoxImage]::Information } else { [System.Windows.MessageBoxImage]::Error }))
+                if ($Result.Success) {
+                    $applicationState.InstalledDrivers.Clear()
+                    $applicationState.SetCurrentInventoryIndex(0)
+                    $uiElements.InstalledDriverListPanel.Children.Clear()
+                    Update-InstalledDriverCounts
                 }
-                catch {
-                    Write-ApplicationLog "Error processing driver removal for index ${index}: $($_.Exception.Message)" ([LogLevel]::Error)
-                    try {
-                        $emergencyArgs = @{ MountDir = $mountPath; Discard = $true }
-                        Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $emergencyArgs | Out-Null
-                    }
-                    catch { }
-                }
-            }
+                Write-ApplicationLog $Result.Message ([LogLevel]$(if ($Result.Success) { 'Success' } else { 'Error' }))
+            }.GetNewClosure()
         
-            $removalDuration = (Get-Date) - $removalStartTime
-            $successMessage = "Driver removal completed. Successfully removed: $totalSuccessfulRemovals drivers. Failed: $totalFailedRemovals drivers. Duration: $([math]::Round($removalDuration.TotalMinutes, 1)) minutes."
-            Update-ApplicationProgress 100.0 $successMessage
-            [System.Windows.MessageBox]::Show($successMessage, "Driver Removal Complete", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
-            Write-ApplicationLog $successMessage ([LogLevel]::Success)
+            $onFinally = {
+                $uiElements.RemoveDriversButton.IsEnabled = $true
+                $uiElements.ExportDriversButton.IsEnabled = $true
+                $uiElements.StartButton.IsEnabled = $true
+                $uiElements.ScanDriversButton.IsEnabled = $true
+                $uiElements.InventoryDriversButton.IsEnabled = $true
+                $uiElements.BrowseWimButton.IsEnabled = $true
+                $uiElements.BrowseMountButton.IsEnabled = $true
+                $uiElements.CancelButton.Content = 'Cancel'
+                $uiElements.CancelButton.IsEnabled = $true
+            }.GetNewClosure()
+
+            $null = Start-AsyncPowerShellWorkflow -ScriptPath $PSCommandPath -Workflow {
+                Invoke-DriverRemovalWorkflow -WimFilePath $WimFilePath -Index $Index -MountPath $MountPath -Drivers $Drivers
+            } -Variables @{
+                WimFilePath = $wimValidation.ResolvedPath
+                Index       = $selectedIndex
+                MountPath   = $mountPath
+                Drivers     = $selectedDrivers
+            } -MountPath $mountPath -BusyState 'RemovingDrivers' -OnCompleted $onCompleted -OnFinally $onFinally
         }
         catch {
-            [System.Windows.MessageBox]::Show("Driver removal operation failed: $($_.Exception.Message)", "Driver Removal Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-            Write-ApplicationLog "Driver removal operation failed: $($_.Exception.Message)" ([LogLevel]::Error)
-        }
-        finally {
-            $uiElements.MainProgressBar.IsIndeterminate = $false
-            $uiElements.MainProgressBar.Value = 0
-            $uiElements.RemoveDriversButton.IsEnabled = $true
-            $uiElements.ExportDriversButton.IsEnabled = $true
-            $script:ApplicationState.SetCurrentState('Idle')
+            Write-ApplicationLog "Could not start driver removal: $($_.Exception.Message)" ([LogLevel]::Error)
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'Driver Removal Error', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
         }
     })
 
@@ -6282,77 +6307,91 @@ $uiElements.RemoveDriversButton.Add_Click({
 $uiElements.ExportDriversButton.Add_Click({
         if ($script:ApplicationState.IsProcessing()) { return }
     
+        $folderDialog = [System.Windows.Forms.FolderBrowserDialog]::new()
+        $folderDialog.Description = 'Select destination folder for driver export'
+        $folderDialog.ShowNewFolderButton = $true
         try {
-            Write-Verbose "User initiated driver export operation"
+            if ($folderDialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
         
+            $wimValidation = Test-WimFileValidation -WimPath $uiElements.WimFileTextBox.Text
+            $mountValidation = Test-SecurePath -Path $uiElements.MountDirTextBox.Text
             $mountPrereqValidation = Test-MountPathPrerequisites -MountPath $uiElements.MountDirTextBox.Text
-            if (-not $mountPrereqValidation.IsValid) {
-                [System.Windows.MessageBox]::Show("Invalid mount directory: $($mountPrereqValidation.ErrorMessage)", "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+            $destinationValidation = Test-SecurePath -Path $folderDialog.SelectedPath
+            if (-not $wimValidation.IsValid -or -not $mountValidation.IsValid -or -not $mountPrereqValidation.IsValid -or -not $destinationValidation.IsValid) {
+                [System.Windows.MessageBox]::Show('Validate the WIM, mount parent, and export destination before continuing.', 'Validation Error', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
                 return
             }
 
-            $folderDialog = [System.Windows.Forms.FolderBrowserDialog]::new()
-            $folderDialog.Description = "Select destination folder for driver export"
-            $folderDialog.ShowNewFolderButton = $true
-        
-            if ($folderDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-                Write-ApplicationLog "Starting driver export to: $($folderDialog.SelectedPath)" ([LogLevel]::Info)
-            
-                $uiElements.ExportDriversButton.IsEnabled = $false
-                $uiElements.RemoveDriversButton.IsEnabled = $false
-                $uiElements.ProgressTextBlock.Text = "Exporting drivers..."
-                $uiElements.MainProgressBar.IsIndeterminate = $true
-            
-                $indexes = Get-WimIndexes -WimFilePath $uiElements.WimFileTextBox.Text
-                $mountPath = $uiElements.MountDirTextBox.Text
-            
-                try {
-                    if (-not (Clear-MountDirectory -MountPath $mountPath)) { throw "Failed to prepare mount directory" }
-                
-                    $mountArgs = @{ ImageFile = $uiElements.WimFileTextBox.Text; Index = $indexes[0]; MountDir = $mountPath }
-                
-                    # --- CORRECTED TIMEOUT ---
-                    $mountResult = Invoke-EnhancedDismOperation -Operation "/Mount-Image" -Arguments $mountArgs -TimeoutMs 1200000 # 20 minutes
-                    if (-not $mountResult.Success) { throw "Failed to mount WIM for driver export" }
-                
-                    Start-Sleep -Milliseconds 3000
-                
-                    $exportResult = Export-DriversFromMountedImage -MountPath $mountPath -DestinationPath $folderDialog.SelectedPath
-                
-                    $unmountArgs = @{ MountDir = $mountPath; Discard = $true }
-                    Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $unmountArgs -TimeoutMs 120000 | Out-Null
-                
-                    if ($exportResult.Success) {
-                        Update-ApplicationProgress 100.0 "Driver export completed successfully"
-                        [System.Windows.MessageBox]::Show("Drivers exported successfully to:`n$($folderDialog.SelectedPath)", "Export Successful", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
-                        Write-ApplicationLog "Driver export completed successfully" ([LogLevel]::Success)
-                    }
-                    else {
-                        throw $exportResult.ErrorMessage
-                    }
-                }
-                catch {
-                    [System.Windows.MessageBox]::Show("Driver export failed: $($_.Exception.Message)", "Export Failed", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-                    Write-ApplicationLog "Driver export failed: $($_.Exception.Message)" ([LogLevel]::Error)
-                }
-                finally {
-                    $uiElements.MainProgressBar.IsIndeterminate = $false
-                    $uiElements.MainProgressBar.Value = 0
-                    $uiElements.ExportDriversButton.IsEnabled = $true
-                    $uiElements.RemoveDriversButton.IsEnabled = $true
-                }
+            $destinationPath = [System.IO.Path]::GetFullPath($destinationValidation.ResolvedPath).TrimEnd('\')
+            $mountParentPath = [System.IO.Path]::GetFullPath($mountValidation.ResolvedPath).TrimEnd('\')
+            if ($destinationPath.Equals($mountParentPath, [StringComparison]::OrdinalIgnoreCase) -or $destinationPath.StartsWith($mountParentPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                [System.Windows.MessageBox]::Show('The export destination cannot be inside the mount parent directory.', 'Invalid Destination', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+                return
             }
+        
+            $selectedIndex = $script:ApplicationState.GetCurrentInventoryIndex()
+            if ($selectedIndex -le 0) {
+                [System.Windows.MessageBox]::Show('Inventory a WIM index before exporting drivers.', 'No Inventory', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                return
+            }
+            
+            $selectedDrivers = Get-SelectedInstalledDrivers
+            if ($selectedDrivers.Count -eq 0) {
+                [System.Windows.MessageBox]::Show('Select at least one driver to export.', 'No Drivers Selected', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                return
+            }
+            
+            $mountPath = New-ApplicationMountDirectory -ParentPath $mountParentPath
+            $uiElements.ExportDriversButton.IsEnabled = $false
+            $uiElements.RemoveDriversButton.IsEnabled = $false
+            $uiElements.StartButton.IsEnabled = $false
+            $uiElements.ScanDriversButton.IsEnabled = $false
+            $uiElements.InventoryDriversButton.IsEnabled = $false
+            $uiElements.BrowseWimButton.IsEnabled = $false
+            $uiElements.BrowseMountButton.IsEnabled = $false
+            $uiElements.CancelButton.IsEnabled = $true
+            $uiElements.CancelButton.Content = 'Cancel Export'
+
+            $onCompleted = {
+                param($Result)
+                [System.Windows.MessageBox]::Show($Result.Message, 'Driver Export', [System.Windows.MessageBoxButton]::OK, $(if ($Result.Success) { [System.Windows.MessageBoxImage]::Information } else { [System.Windows.MessageBoxImage]::Error }))
+                Write-ApplicationLog $Result.Message ([LogLevel]$(if ($Result.Success) { 'Success' } else { 'Error' }))
+            }.GetNewClosure()
+                
+            $onFinally = {
+                $uiElements.ExportDriversButton.IsEnabled = $true
+                $uiElements.RemoveDriversButton.IsEnabled = $true
+                $uiElements.StartButton.IsEnabled = $true
+                $uiElements.ScanDriversButton.IsEnabled = $true
+                $uiElements.InventoryDriversButton.IsEnabled = $true
+                $uiElements.BrowseWimButton.IsEnabled = $true
+                $uiElements.BrowseMountButton.IsEnabled = $true
+                $uiElements.CancelButton.Content = 'Cancel'
+                $uiElements.CancelButton.IsEnabled = $true
+            }.GetNewClosure()
+                
+            $null = Start-AsyncPowerShellWorkflow -ScriptPath $PSCommandPath -Workflow {
+                Invoke-DriverExportWorkflow -WimFilePath $WimFilePath -Index $Index -MountPath $MountPath -DestinationPath $DestinationPath -Drivers $Drivers
+            } -Variables @{
+                WimFilePath      = $wimValidation.ResolvedPath
+                Index            = $selectedIndex
+                MountPath        = $mountPath
+                DestinationPath  = $destinationPath
+                Drivers          = $selectedDrivers
+            } -MountPath $mountPath -BusyState 'Processing' -OnCompleted $onCompleted -OnFinally $onFinally
         }
         catch {
-            Write-ApplicationLog "Error during driver export: $($_.Exception.Message)" ([LogLevel]::Error)
+            Write-ApplicationLog "Could not start driver export: $($_.Exception.Message)" ([LogLevel]::Error)
+            [System.Windows.MessageBox]::Show($_.Exception.Message, 'Driver Export Error', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
         }
         finally {
-            if ($folderDialog) { $folderDialog.Dispose() }
+            $folderDialog.Dispose()
         }
     })
 
 # Driver Folder Browse Handler
 $uiElements.BrowseDriverButton.Add_Click({
+        if ($script:ApplicationState.IsProcessing()) { return }
         try {
             Write-Verbose "User initiated driver folder selection"
         
@@ -6364,15 +6403,17 @@ $uiElements.BrowseDriverButton.Add_Click({
             if ($folderDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
                 Write-Verbose "User selected folder: $($folderDialog.SelectedPath)"
             
-                $validation = Test-DriverFolderValidation -DriverPath $folderDialog.SelectedPath
-                if ($validation.IsValid) {
+                $validation = Test-SecurePath -Path $folderDialog.SelectedPath
+                if ($validation.IsValid -and [System.IO.Directory]::Exists($validation.ResolvedPath)) {
                     $uiElements.DriverFolderTextBox.Text = $validation.ResolvedPath
                     $uiElements.ScanDriversButton.IsEnabled = $true
                 
                     $uiElements.DriverSelectionCard.Visibility = [System.Windows.Visibility]::Collapsed
+                    $uiElements.DriverListPanel.Children.Clear()
                     $script:ApplicationState.DiscoveredDrivers.Clear()
+                    Update-DriverSelectionCount
                 
-                    Write-ApplicationLog "Driver folder selected: $([System.IO.Path]::GetFileName($validation.ResolvedPath)) ($($validation.AdditionalData.InfCount) INF files found)" ([LogLevel]::Info)
+                    Write-ApplicationLog "Driver folder selected: $([System.IO.Path]::GetFileName($validation.ResolvedPath))" ([LogLevel]::Info)
                 }
                 else {
                     [System.Windows.MessageBox]::Show(
@@ -6463,87 +6504,65 @@ $uiElements.BrowseMountButton.Add_Click({
         }
     })
 
-# Updated Driver Scanning Handler - Using Enhanced Approach
+# Updated Driver Scanning Handler - Asynchronous
 $uiElements.ScanDriversButton.Add_Click({
-        if ([string]::IsNullOrWhiteSpace($uiElements.DriverFolderTextBox.Text) -or 
-            $uiElements.DriverFolderTextBox.Text -eq "No folder selected...") {
-            [System.Windows.MessageBox]::Show(
-                "Please select a driver folder first before scanning for drivers.", 
-                "No Folder Selected", 
-                [System.Windows.MessageBoxButton]::OK, 
-                [System.Windows.MessageBoxImage]::Warning
-            )
+        if ($script:ApplicationState.IsProcessing()) { return }
+        if ([string]::IsNullOrWhiteSpace($uiElements.DriverFolderTextBox.Text) -or $uiElements.DriverFolderTextBox.Text -eq 'No folder selected...') {
+            [System.Windows.MessageBox]::Show('Please select a driver folder first.', 'No Folder Selected', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
             return
         }
     
         try {
-            Write-Verbose "Starting enhanced driver scanning operation"
-        
+            $applicationState = $script:ApplicationState
+            $scanRootPath = $uiElements.DriverFolderTextBox.Text
             $uiElements.ScanDriversButton.IsEnabled = $false
-            $uiElements.ScanDriversButton.Content = "Scanning..."
-            $uiElements.ProgressTextBlock.Text = "Scanning for drivers..."
-            $uiElements.MainProgressBar.IsIndeterminate = $true
-            $script:ApplicationState.SetCurrentState('Scanning')
-        
-            Write-ApplicationLog "Starting enhanced driver scan in: $($uiElements.DriverFolderTextBox.Text)" ([LogLevel]::Info)
-        
-            $scanStartTime = Get-Date
-        
-            try {
-                # Use the enhanced recursive driver discovery
-                $drivers = Get-DriversRecursive -RootPath $uiElements.DriverFolderTextBox.Text
-            
-                # Clear and update discovered drivers list
-                $script:ApplicationState.DiscoveredDrivers.Clear()
-                foreach ($driver in $drivers) {
-                    [void]$script:ApplicationState.DiscoveredDrivers.Add($driver)
+            $uiElements.BrowseDriverButton.IsEnabled = $false
+            $uiElements.ScanDriversButton.Content = 'Scanning...'
+            $uiElements.CancelButton.Content = 'Cancel Scan'
+            $uiElements.CancelButton.IsEnabled = $true
+
+            $onCompleted = {
+                param($Drivers)
+                if (-not [string]::Equals([string]$uiElements.DriverFolderTextBox.Text, [string]$scanRootPath, [StringComparison]::OrdinalIgnoreCase)) {
+                    Write-ApplicationLog 'Scan results were discarded because the driver folder changed.' ([LogLevel]::Warning)
+                    return
                 }
-            
-                # Update UI with discovered drivers
-                Update-DriverSelectionUI -Drivers $drivers
-            
-                $scanDuration = (Get-Date) - $scanStartTime
-                $signedCount = ($drivers | Where-Object { $_.IsSigned() }).Count
-                $unsignedCount = $drivers.Count - $signedCount
-            
-                Update-ApplicationProgress 100.0 "Found $($drivers.Count) drivers ($signedCount signed, $unsignedCount unsigned)"
-            
-                Write-ApplicationLog "Enhanced driver scan completed in $([math]::Round($scanDuration.TotalSeconds, 1))s" ([LogLevel]::Success)
-                Write-ApplicationLog "Results: $($drivers.Count) drivers total ($signedCount signed, $unsignedCount unsigned)" ([LogLevel]::Info)
-            
-                if ($drivers.Count -gt 0) {
+                $applicationState.DiscoveredDrivers.Clear()
+                foreach ($driver in @($Drivers)) {
+                    [void]$applicationState.DiscoveredDrivers.Add($driver)
+                }
+                Update-DriverSelectionUI -Drivers @($Drivers)
+                $signedCount = @($Drivers | Where-Object { $_.IsSigned() }).Count
+                Write-ApplicationLog "Found $($Drivers.Count) drivers ($signedCount signed, $($Drivers.Count - $signedCount) unsigned)." ([LogLevel]::Success)
+                if ($Drivers.Count -gt 0) {
                     Update-WorkflowStep -Step ([WorkflowStep]::Configure)
-                
-                    # Show processing method recommendation
-                    if ($drivers.Count -gt 20) {
-                        Write-ApplicationLog "Large driver set detected - batch-style processing recommended for speed" ([LogLevel]::Info)
-                    }
                 }
-            
-                if ($unsignedCount -gt 0) {
-                    Write-ApplicationLog "Warning: $unsignedCount unsigned drivers detected" ([LogLevel]::Warning)
-                }
-            }
-            catch {
-                [System.Windows.MessageBox]::Show(
-                    "Driver scan failed: $($_.Exception.Message)", 
-                    "Driver Scan Error", 
-                    [System.Windows.MessageBoxButton]::OK, 
-                    [System.Windows.MessageBoxImage]::Error
-                )
-                Update-ApplicationProgress 0.0 "Driver scan failed"
-                Write-ApplicationLog "Enhanced driver scan failed: $($_.Exception.Message)" ([LogLevel]::Error)
-            }
+            }.GetNewClosure()
+
+            $onFinally = {
+                $uiElements.ScanDriversButton.IsEnabled = $true
+                $uiElements.BrowseDriverButton.IsEnabled = $true
+                $uiElements.ScanDriversButton.Content = 'Scan Drivers'
+                $uiElements.CancelButton.Content = 'Cancel'
+                $uiElements.CancelButton.IsEnabled = $true
+                Update-DriverSelectionCount
+            }.GetNewClosure()
+
+            $null = Start-AsyncPowerShellWorkflow -ScriptPath $PSCommandPath -Workflow {
+                Get-DriversRecursive -RootPath $RootPath -Recurse:$Recurse
+            } -Variables @{
+                RootPath = $uiElements.DriverFolderTextBox.Text
+                Recurse  = [bool]$uiElements.RecurseCheckBox.IsChecked
+            } -BusyState 'Scanning' -OnCompleted $onCompleted -OnFinally $onFinally
         }
         catch {
-            Write-ApplicationLog "Error during enhanced driver scan: $($_.Exception.Message)" ([LogLevel]::Error)
-        }
-        finally {
-            $uiElements.MainProgressBar.IsIndeterminate = $false
-            $uiElements.MainProgressBar.Value = 0
-            $uiElements.ScanDriversButton.IsEnabled = $true
-            $uiElements.ScanDriversButton.Content = "Scan Drivers"
             $script:ApplicationState.SetCurrentState('Idle')
+            $uiElements.ScanDriversButton.IsEnabled = $true
+            $uiElements.BrowseDriverButton.IsEnabled = $true
+            $uiElements.ScanDriversButton.Content = 'Scan Drivers'
+            $uiElements.CancelButton.Content = 'Cancel'
+            Update-DriverSelectionCount
+            Write-ApplicationLog "Could not start driver scan: $($_.Exception.Message)" ([LogLevel]::Error)
         }
     })
 
@@ -6711,6 +6730,7 @@ $uiElements.ForceUnsignedCheckBox.Add_Checked({
 
 Write-Verbose "Enhanced event handlers with driver management configured successfully"
 #endregion
+}
 
 #region 13. Simplified Core Workflow Implementation
 <#
@@ -6735,7 +6755,7 @@ Write-Verbose "Enhanced event handlers with driver management configured success
     - Simple mount -> inject -> commit/unmount cycles per index
     - User maintains full control over all paths and selections
     - Enhanced error handling without complexity
-    - Option for batch-style recursive or individual driver processing
+    - Option for batch-style validated selection or individual driver processing
     
 .PARAMETER WimFilePath
     Path to the Windows Image file to modify (user-selected)
@@ -6750,7 +6770,7 @@ Write-Verbose "Enhanced event handlers with driver management configured success
     Whether to force installation of unsigned drivers
     
 .PARAMETER UseRecursiveMethod
-    Whether to use batch-style recursive injection (faster, less control)
+    Whether to use one batch-style DISM operation for the validated driver set
     
 .OUTPUTS
     WorkflowResult object with comprehensive operation results
@@ -6792,7 +6812,7 @@ function Invoke-DriverInjectionWorkflow {
             Write-ApplicationLog "Target WIM: $([System.IO.Path]::GetFileName($WimFilePath))" ([LogLevel]::Info)
             Write-ApplicationLog "Selected drivers: $($SelectedDrivers.Count)" ([LogLevel]::Info)
             Write-ApplicationLog "Mount directory: $MountDirectoryPath" ([LogLevel]::Info)
-            Write-ApplicationLog "Method: $(if ($UseRecursiveMethod) { 'Batch-style recursive' } else { 'Individual selection' })" ([LogLevel]::Info)
+            Write-ApplicationLog "Method: $(if ($UseRecursiveMethod) { 'Batch-style validated set' } else { 'Individual selection' })" ([LogLevel]::Info)
             
             Update-ApplicationProgress 10 "Initializing workflow..."
             
@@ -6836,9 +6856,7 @@ function Invoke-DriverInjectionWorkflow {
                 
                 try {
                     if ($UseRecursiveMethod) {
-                        # Batch-style: use the user-selected driver folder
-                        $driverFolder = if (-not [string]::IsNullOrWhiteSpace($DriverFolderPath)) { $DriverFolderPath } else { [System.IO.Path]::GetDirectoryName($SelectedDrivers[0].FullPath) }
-                        $success = Invoke-SimpleBatchStyleProcessing -WimFilePath $WimFilePath -Index $index -MountPath $MountDirectoryPath -DriverFolder $driverFolder -ForceUnsigned:$ForceUnsignedDrivers
+                        $success = Invoke-SimpleBatchStyleProcessing -WimFilePath $WimFilePath -Index $index -MountPath $MountDirectoryPath -Drivers $SelectedDrivers -ForceUnsigned:$ForceUnsignedDrivers
                     }
                     else {
                         # Individual: process selected drivers one by one
@@ -6877,18 +6895,23 @@ function Invoke-DriverInjectionWorkflow {
                 $result.Details = @"
 Successfully processed: $successfulIndexes/$($indexes.Count) indexes
 Duration: $([math]::Round($result.Duration.TotalMinutes, 1)) minutes
-Method: $(if ($UseRecursiveMethod) { 'Batch-style recursive' } else { 'Individual driver selection' })
+Method: $(if ($UseRecursiveMethod) { 'Batch-style validated selection' } else { 'Individual driver selection' })
 "@
             }
             elseif ($successfulIndexes -gt 0) {
                 Update-ApplicationProgress 100.0 "Driver injection completed with some failures"
-                $result.Success = $true
+                $result.Success = $false
                 $result.Message = "Partially successful - some indexes failed"
                 $result.Details = @"
 Successfully processed: $successfulIndexes/$($indexes.Count) indexes
 Failed indexes: $failedIndexes
 Duration: $([math]::Round($result.Duration.TotalMinutes, 1)) minutes
 "@
+                $result.ErrorInfo = @{
+                    Type    = 'PartialIndexFailure'
+                    Message = $result.Message
+                    Details = $result.Details
+                }
             }
             else {
                 Update-ApplicationProgress 0.0 "Driver injection failed"
@@ -6911,13 +6934,10 @@ Duration: $([math]::Round($result.Duration.TotalMinutes, 1)) minutes
             return $result
         }
         finally {
-            # Simple cleanup
             try {
-                if ([System.IO.Directory]::Exists($MountDirectoryPath)) {
-                    $items = Get-ChildItem -Path $MountDirectoryPath -Force -ErrorAction SilentlyContinue
-                    if ($items.Count -gt 0) {
-                        $cleanupArgs = @{ MountDir = $MountDirectoryPath }
-                        Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $cleanupArgs | Out-Null
+                if (Test-ApplicationMountDirectory -MountPath $MountDirectoryPath) {
+                    if (Clear-MountDirectory -MountPath $MountDirectoryPath) {
+                        Clear-ApplicationMountDirectory -MountPath $MountDirectoryPath | Out-Null
                     }
                 }
             }
@@ -6930,12 +6950,12 @@ Duration: $([math]::Round($result.Duration.TotalMinutes, 1)) minutes
 
 <#
 .SYNOPSIS
-    Simple batch-style processing: mount -> recursive inject -> commit/unmount.
+    Simple batch-style processing: mount -> inject validated driver set -> commit/unmount.
     
 .DESCRIPTION
     Replicates the batch file's simple and reliable approach:
     - One mount operation
-    - One recursive driver injection command
+    - One driver injection command for the validated driver set
     - One commit/unmount operation
     - Minimal complexity, maximum reliability
     
@@ -6948,8 +6968,8 @@ Duration: $([math]::Round($result.Duration.TotalMinutes, 1)) minutes
 .PARAMETER MountPath
     Mount directory path
     
-.PARAMETER DriverFolder
-    Folder containing drivers (will be processed recursively)
+.PARAMETER Drivers
+    Validated driver packages to inject as one batch
     
 .PARAMETER ForceUnsigned
     Whether to force unsigned driver installation
@@ -6971,7 +6991,7 @@ function Invoke-SimpleBatchStyleProcessing {
         [string]$MountPath,
         
         [Parameter(Mandatory = $true)]
-        [string]$DriverFolder,
+        [DriverInfo[]]$Drivers,
         
         [Parameter(Mandatory = $false)]
         [switch]$ForceUnsigned
@@ -7001,37 +7021,35 @@ function Invoke-SimpleBatchStyleProcessing {
             Start-Sleep -Milliseconds 3000
             if (-not (Test-Path ([System.IO.Path]::Combine($MountPath, "Windows")))) {
                 Write-ApplicationLog "Mount verification failed" ([LogLevel]::Error)
+                Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{ MountDir = $MountPath; Discard = $true } -TimeoutMs 180000 | Out-Null
                 return $false
             }
             
             $driverArgs = @{
-                Image   = $MountPath
-                Driver  = $DriverFolder
-                Recurse = $true
+                Image  = $MountPath
+                Driver = @($Drivers | ForEach-Object { $_.FullPath })
             }
             if ($ForceUnsigned) { $driverArgs.ForceUnsigned = $true }
             
-            $driverResult = Invoke-EnhancedDismOperation -Operation "/Add-Driver" -Arguments $driverArgs -TimeoutMs 600000
-            
-            # --- CORRECTED UNMOUNT CALL ---
+            $driverResult = Invoke-EnhancedDismOperation -Operation '/Add-Driver' -Arguments $driverArgs -TimeoutMs 600000
+            $shouldCommit = $driverResult.Success
             $unmountArgs = @{
                 MountDir = $MountPath
-                Commit   = $true
+                Commit   = $shouldCommit
+                Discard  = -not $shouldCommit
             }
-            $unmountResult = Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $unmountArgs -TimeoutMs 180000
+            $unmountResult = Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments $unmountArgs -TimeoutMs 180000
             
-            if ($driverResult.Success -and $unmountResult.Success) {
+            if ($shouldCommit -and $unmountResult.Success) {
                 Write-ApplicationLog "Batch-style processing successful for index $Index" ([LogLevel]::Success)
                 return $true
             }
-            else {
-                Write-ApplicationLog "Batch-style processing failed - Driver: $($driverResult.Success), Unmount: $($unmountResult.Success)" ([LogLevel]::Error)
-                if (-not $unmountResult.Success) {
-                    $discardArgs = @{ MountDir = $MountPath; Discard = $true }
-                    Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $discardArgs -TimeoutMs 180000 | Out-Null
-                }
-                return $false
+
+            Write-ApplicationLog "Batch-style processing failed - Driver: $($driverResult.Success), Unmount: $($unmountResult.Success)" ([LogLevel]::Error)
+            if (-not $unmountResult.Success) {
+                Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{ MountDir = $MountPath; Discard = $true } -TimeoutMs 180000 | Out-Null
             }
+            return $false
         }
         catch {
             Write-ApplicationLog "Exception in batch-style processing: $($_.Exception.Message)" ([LogLevel]::Error)
@@ -7054,7 +7072,7 @@ function Invoke-SimpleBatchStyleProcessing {
     - One mount operation  
     - Individual driver injection (user maintains control)
     - One commit/unmount operation
-    - Commit if any drivers succeed
+    - Commit only when every selected driver succeeds
     
 .PARAMETER WimFilePath
     Path to the WIM file
@@ -7118,6 +7136,7 @@ function Invoke-SimpleIndividualProcessing {
             Start-Sleep -Milliseconds 3000
             if (-not (Test-Path ([System.IO.Path]::Combine($MountPath, "Windows")))) {
                 Write-ApplicationLog "Mount verification failed" ([LogLevel]::Error)
+                Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{ MountDir = $MountPath; Discard = $true } -TimeoutMs 180000 | Out-Null
                 return $false
             }
             
@@ -7146,28 +7165,27 @@ function Invoke-SimpleIndividualProcessing {
                 }
             }
             
-            # --- CORRECTED UNMOUNT CALL ---
-            $shouldCommit = ($successCount -gt 0)
+            $shouldCommit = ($failureCount -eq 0 -and $successCount -eq $Drivers.Count)
             $unmountArgs = @{
                 MountDir = $MountPath
                 Commit   = $shouldCommit
                 Discard  = -not $shouldCommit
             }
-            $unmountResult = Invoke-EnhancedDismOperation -Operation "/Unmount-Image" -Arguments $unmountArgs -TimeoutMs 180000
+            $unmountResult = Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments $unmountArgs -TimeoutMs 180000
             
             if ($unmountResult.Success) {
                 if ($shouldCommit) {
                     Write-ApplicationLog "Individual processing successful: $successCount/$($Drivers.Count) drivers installed" ([LogLevel]::Success)
                 }
                 else {
-                    Write-ApplicationLog "Individual processing completed but no drivers were installed; changes discarded." ([LogLevel]::Warning)
+                    Write-ApplicationLog "Individual processing completed with failures; changes discarded." ([LogLevel]::Warning)
                 }
                 return $shouldCommit
             }
-            else {
-                Write-ApplicationLog "Unmount failed: $($unmountResult.StandardError)" ([LogLevel]::Error)
-                return $false
-            }
+
+            Write-ApplicationLog "Unmount failed: $($unmountResult.StandardError)" ([LogLevel]::Error)
+            Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{ MountDir = $MountPath; Discard = $true } -TimeoutMs 180000 | Out-Null
+            return $false
         }
         catch {
             Write-ApplicationLog "Exception in individual processing: $($_.Exception.Message)" ([LogLevel]::Error)
@@ -7181,8 +7199,458 @@ function Invoke-SimpleIndividualProcessing {
     }
 }
 
+function Invoke-DriverRemovalWorkflow {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WimFilePath,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Index,
+
+        [Parameter(Mandatory = $true)]
+        [string]$MountPath,
+
+        [Parameter(Mandatory = $true)]
+        [InstalledDriverInfo[]]$Drivers
+    )
+
+    $result = @{
+        Success            = $false
+        SuccessfulRemovals = 0
+        FailedRemovals     = 0
+        SkippedDrivers     = 0
+        Message            = ''
+    }
+
+    try {
+        if (-not (Clear-MountDirectory -MountPath $MountPath)) {
+            throw 'Could not prepare the owned mount directory.'
+        }
+
+        $mountResult = Invoke-EnhancedDismOperation -Operation '/Mount-Image' -Arguments @{
+            ImageFile = $WimFilePath
+            Index     = $Index
+            MountDir  = $MountPath
+        } -TimeoutMs 1200000
+        if (-not $mountResult.Success) {
+            throw "Mount failed: $($mountResult.StandardError)"
+        }
+        if (-not [System.IO.Directory]::Exists((Join-Path $MountPath 'Windows'))) {
+            throw 'Mount verification failed: Windows directory was not found.'
+        }
+
+        $removalResult = Remove-DriversFromMountedImage -MountPath $MountPath -DriversToRemove $Drivers
+        $result.SuccessfulRemovals = $removalResult.SuccessfulRemovals
+        $result.FailedRemovals = $removalResult.FailedRemovals
+        $result.SkippedDrivers = $removalResult.SkippedDrivers
+        $shouldCommit = ($removalResult.Success -and $removalResult.SuccessfulRemovals -gt 0)
+
+        $unmountResult = Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{
+            MountDir = $MountPath
+            Commit   = $shouldCommit
+            Discard  = -not $shouldCommit
+        } -TimeoutMs 180000
+
+        $result.Success = ($shouldCommit -and $unmountResult.Success)
+        $result.Message = "Removed $($result.SuccessfulRemovals), failed $($result.FailedRemovals), skipped $($result.SkippedDrivers)."
+        if (-not $unmountResult.Success) {
+            Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{ MountDir = $MountPath; Discard = $true } -TimeoutMs 180000 | Out-Null
+            $result.Message += ' Unmount failed; manual cleanup may be required.'
+        }
+    }
+    catch {
+        $result.Message = $_.Exception.Message
+        try {
+            Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{ MountDir = $MountPath; Discard = $true } -TimeoutMs 180000 | Out-Null
+        }
+        catch { }
+    }
+
+    return $result
+}
+
+function Invoke-DriverExportWorkflow {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WimFilePath,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Index,
+
+        [Parameter(Mandatory = $true)]
+        [string]$MountPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath,
+
+        [Parameter(Mandatory = $true)]
+        [InstalledDriverInfo[]]$Drivers
+    )
+
+    $result = @{
+        Success = $false
+        Message = ''
+    }
+
+    try {
+        if (-not (Clear-MountDirectory -MountPath $MountPath)) {
+            throw 'Could not prepare the owned mount directory.'
+        }
+
+        $mountResult = Invoke-EnhancedDismOperation -Operation '/Mount-Image' -Arguments @{
+            ImageFile = $WimFilePath
+            Index     = $Index
+            MountDir  = $MountPath
+        } -TimeoutMs 1200000
+        if (-not $mountResult.Success) {
+            throw "Mount failed: $($mountResult.StandardError)"
+        }
+        if (-not [System.IO.Directory]::Exists((Join-Path $MountPath 'Windows'))) {
+            throw 'Mount verification failed: Windows directory was not found.'
+        }
+
+        $exportResult = Export-DriversFromMountedImage -MountPath $MountPath -DestinationPath $DestinationPath -DriversToExport $Drivers
+        $unmountResult = Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{
+            MountDir = $MountPath
+            Discard  = $true
+        } -TimeoutMs 180000
+
+        $result.Success = ($exportResult.Success -and $unmountResult.Success)
+        $result.Message = if ($result.Success) { "Drivers exported to $DestinationPath" } else { "Driver export failed: $($exportResult.ErrorMessage)" }
+        if (-not $unmountResult.Success) {
+            $result.Success = $false
+            $result.Message += ' Unmount failed; manual cleanup may be required.'
+        }
+    }
+    catch {
+        $result.Message = $_.Exception.Message
+        try {
+            Invoke-EnhancedDismOperation -Operation '/Unmount-Image' -Arguments @{ MountDir = $MountPath; Discard = $true } -TimeoutMs 180000 | Out-Null
+        }
+        catch { }
+    }
+
+    return $result
+}
+
+function Get-OperationJournalPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return (Join-Path $env:ProgramData 'WIM Driver Studio\operation.json')
+}
+
+function Write-OperationJournal {
+    [CmdletBinding()]
+    param(
+        [string]$JournalPath = (Get-OperationJournalPath),
+        [Parameter(Mandatory = $true)]
+        [string]$MountPath,
+        [string]$WimFilePath = '',
+        [int]$Index = 0,
+        [Parameter(Mandatory = $true)]
+        [string]$Phase
+    )
+
+    $journalDirectory = Split-Path -Parent -Path $JournalPath
+    [System.IO.Directory]::CreateDirectory($journalDirectory) | Out-Null
+    $temporaryPath = "$JournalPath.tmp"
+    try {
+        [PSCustomObject]@{
+            Owner       = 'WIM Driver Studio'
+            MountPath   = $MountPath
+            WimFilePath = $WimFilePath
+            Index       = $Index
+            Phase       = $Phase
+            StartedAt   = [DateTime]::UtcNow.ToString('o')
+        } | ConvertTo-Json | Out-File -LiteralPath $temporaryPath -Encoding UTF8
+        Move-Item -LiteralPath $temporaryPath -Destination $JournalPath -Force -ErrorAction Stop
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-StaleOperationJournal {
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$JournalPath = (Get-OperationJournalPath)
+    )
+
+    if (-not [System.IO.File]::Exists($JournalPath)) {
+        return $null
+    }
+
+    try {
+        $journal = Get-Content -LiteralPath $JournalPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($journal.Owner -eq 'WIM Driver Studio') {
+            return $journal
+        }
+    }
+    catch {
+        Write-Verbose "Could not read operation journal: $($_.Exception.Message)"
+    }
+
+    return $null
+}
+
+function Clear-OperationJournal {
+    [CmdletBinding()]
+    param(
+        [string]$JournalPath = (Get-OperationJournalPath)
+    )
+
+    Remove-Item -LiteralPath $JournalPath -Force -ErrorAction SilentlyContinue
+}
+
+function Complete-OperationJournal {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [string]$JournalPath = (Get-OperationJournalPath),
+        [string]$MountPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($MountPath)) {
+        $journal = Get-StaleOperationJournal -JournalPath $JournalPath
+        if ($null -eq $journal) {
+            return $true
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$journal.MountPath)) {
+            Clear-OperationJournal -JournalPath $JournalPath
+            return $true
+        }
+        return $false
+    }
+    if (-not (Test-ApplicationMountDirectory -MountPath $MountPath)) {
+        return $false
+    }
+    if (-not (Clear-MountDirectory -MountPath $MountPath)) {
+        return $false
+    }
+    if (-not (Clear-ApplicationMountDirectory -MountPath $MountPath)) {
+        return $false
+    }
+
+    Clear-OperationJournal -JournalPath $JournalPath
+    return $true
+}
+
+function Start-AsyncPowerShellWorkflow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Workflow,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Variables = @{},
+
+        [Parameter(Mandatory = $false)]
+        [string]$MountPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BusyState,
+
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$OnCompleted,
+
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$OnCancelled,
+
+        [Parameter(Mandatory = $false)]
+        [scriptblock]$OnFinally
+    )
+
+    $applicationState = $script:ApplicationState
+    $journalPath = Get-OperationJournalPath
+    $messageQueue = New-OperationMessageQueue
+    $activeProcesses = [System.Collections.Concurrent.ConcurrentDictionary[string, System.Diagnostics.Process]]::new()
+    $applicationState.SetActiveProcesses($activeProcesses)
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $powershell = $null
+    $asyncResult = $null
+    $monitorTimer = $null
+
+    try {
+        $runspace.Open()
+        $loader = [System.Management.Automation.PowerShell]::Create()
+        $loader.Runspace = $runspace
+        try {
+            $null = $loader.AddScript('param([string]$Path) . $Path -LibraryOnly').AddArgument($ScriptPath).Invoke()
+            if ($loader.HadErrors) {
+                throw ($loader.Streams.Error | Select-Object -First 1).Exception
+            }
+        }
+        finally {
+            $loader.Dispose()
+        }
+
+        $setup = [System.Management.Automation.PowerShell]::Create()
+        $setup.Runspace = $runspace
+        try {
+            $null = $setup.AddScript('param($Queue, $Processes) $script:OperationMessageQueue = $Queue; $script:SharedActiveProcesses = $Processes').AddArgument($messageQueue).AddArgument($activeProcesses).Invoke()
+            if ($setup.HadErrors) {
+                throw ($setup.Streams.Error | Select-Object -First 1).Exception
+            }
+        }
+        finally {
+            $setup.Dispose()
+        }
+
+        foreach ($key in $Variables.Keys) {
+            $runspace.SessionStateProxy.SetVariable($key, $Variables[$key])
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($MountPath)) {
+            Write-OperationJournal -JournalPath $journalPath -MountPath $MountPath -WimFilePath ([string]$Variables['WimFilePath']) -Index ([int]$Variables['Index']) -Phase $BusyState
+        }
+
+        $powershell = [System.Management.Automation.PowerShell]::Create()
+        $powershell.Runspace = $runspace
+        $powershell.AddScript($Workflow) | Out-Null
+        $asyncResult = $powershell.BeginInvoke()
+
+        $applicationState.SetCurrentState($BusyState)
+        $applicationState.SetCurrentPowerShell($powershell)
+        $applicationState.SetCurrentRunspace($runspace)
+        $applicationState.SetBackgroundResult($asyncResult)
+        $applicationState.SetCurrentMountPath($MountPath)
+
+        $monitorTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $monitorTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $tickHandler = {
+            try {
+            $message = Take-OperationMessage -Queue $messageQueue
+            while ($null -ne $message) {
+                if ($message.Progress -gt 0) {
+                    Update-ApplicationProgress $message.Progress $message.Status
+                }
+                if (-not [string]::IsNullOrWhiteSpace($message.Message)) {
+                    Write-ApplicationLog $message.Message ([LogLevel]$message.Level)
+                }
+                $message = Take-OperationMessage -Queue $messageQueue
+            }
+
+            if ($asyncResult.IsCompleted) {
+                $monitorTimer.Stop()
+                try {
+                    $result = $powershell.EndInvoke($asyncResult)
+                    if ($OnCompleted) {
+                        & $OnCompleted $result
+                    }
+                }
+                catch {
+                    Write-ApplicationLog "Asynchronous workflow failed: $($_.Exception.Message)" ([LogLevel]::Error)
+                }
+                finally {
+                    foreach ($activeProcess in @($activeProcesses.Values)) {
+                        try {
+                            if (-not $activeProcess.HasExited) { $activeProcess.Kill() }
+                        }
+                        catch { }
+                    }
+                    try { $powershell.Dispose() } catch { }
+                    try { $runspace.Close() } catch { }
+                    try { $runspace.Dispose() } catch { }
+                    $applicationState.SetCurrentPowerShell($null)
+                    $applicationState.SetCurrentRunspace($null)
+                    $applicationState.SetBackgroundResult($null)
+                    $journalCompleted = $false
+                    try { $journalCompleted = Complete-OperationJournal -JournalPath $journalPath -MountPath $MountPath } catch { }
+                    if (-not $journalCompleted) {
+                        Write-ApplicationLog 'Operation cleanup was incomplete; the recovery journal was retained.' ([LogLevel]::Error)
+                    }
+                    $applicationState.SetCurrentMountPath($null)
+                    $applicationState.SetActiveProcesses($null)
+                    $applicationState.SetCurrentState('Idle')
+                    if ($OnFinally) {
+                        & $OnFinally
+                    }
+                }
+            }
+            elseif ($applicationState.GetCurrentState() -eq 'Cancelling') {
+                $monitorTimer.Stop()
+                foreach ($activeProcess in @($activeProcesses.Values)) {
+                    try {
+                        if (-not $activeProcess.HasExited) {
+                            $activeProcess.Kill()
+                            $activeProcess.WaitForExit(5000) | Out-Null
+                        }
+                    }
+                    catch { }
+                }
+                try { $powershell.Stop() } catch { }
+                try { $asyncResult.AsyncWaitHandle.WaitOne(10000) | Out-Null } catch { }
+                if ($OnCancelled) {
+                    & $OnCancelled
+                }
+                try { $powershell.Dispose() } catch { }
+                try { $runspace.Close() } catch { }
+                try { $runspace.Dispose() } catch { }
+                $applicationState.SetCurrentPowerShell($null)
+                $applicationState.SetCurrentRunspace($null)
+                $applicationState.SetBackgroundResult($null)
+                $journalCompleted = $false
+                try { $journalCompleted = Complete-OperationJournal -JournalPath $journalPath -MountPath $MountPath } catch { }
+                if (-not $journalCompleted) {
+                    Write-ApplicationLog 'Cancellation cleanup was incomplete; the recovery journal was retained.' ([LogLevel]::Error)
+                }
+                $applicationState.SetCurrentMountPath($null)
+                $applicationState.SetActiveProcesses($null)
+                $applicationState.SetCurrentState('Idle')
+                if ($OnFinally) {
+                    & $OnFinally
+                }
+            }
+            }
+            catch {
+                Write-ApplicationLog "Async workflow monitor error: $($_.Exception.Message)" ([LogLevel]::Error)
+            }
+        }
+        $monitorTimer.Add_Tick($tickHandler.GetNewClosure())
+        $monitorTimer.Start()
+
+        return @{
+            PowerShell = $powershell
+            Runspace   = $runspace
+            Timer      = $monitorTimer
+            Result     = $asyncResult
+            Processes  = $activeProcesses
+            Messages   = $messageQueue
+        }
+    }
+    catch {
+        if ($null -ne $monitorTimer) { $monitorTimer.Stop() }
+        if ($null -ne $powershell) { try { $powershell.Dispose() } catch { } }
+        try { $runspace.Close(); $runspace.Dispose() } catch { }
+        try { Complete-OperationJournal -JournalPath $journalPath -MountPath $MountPath | Out-Null } catch { }
+        $applicationState.SetCurrentPowerShell($null)
+        $applicationState.SetCurrentRunspace($null)
+        $applicationState.SetBackgroundResult($null)
+        $applicationState.SetCurrentMountPath($null)
+        $applicationState.SetActiveProcesses($null)
+        $applicationState.SetCurrentState('Idle')
+        if ($OnFinally) { try { & $OnFinally } catch { } }
+        throw
+    }
+}
+
 Write-Verbose "Simplified core workflow with batch processing reliability loaded successfully"
 #endregion
+
+if ($LibraryOnly) {
+    Write-Verbose "Library-only mode initialized; WPF UI was not started."
+    return
+}
 
 #region 14. Enhanced UI Management Functions
 <#
@@ -7275,9 +7743,6 @@ function Update-DriverSelectionUI {
         $driverSummaryText.Text = "Found $($Drivers.Count) drivers ($signedCount signed, $unsignedCount unsigned). For ${imageLabel}: $($suitableEntries.Count) recommended, $($notRecommendedEntries.Count) not recommended."
         Write-ApplicationLog "Suitability for ${imageLabel}: $($suitableEntries.Count) recommended, $($notRecommendedEntries.Count) not recommended" ([LogLevel]::Info)
         
-        # Limit number of drivers displayed per section to prevent resource exhaustion
-        $maxDriversToDisplay = $script:Configuration.DriverDisplayBatchSize
-        
         # Section 1: Recommended (suitable) drivers, pre-checked
         $recommendedHeader = [System.Windows.Controls.TextBlock]::new()
         $recommendedHeader.Text = "[OK] Recommended for ${imageLabel} ($($suitableEntries.Count))"
@@ -7297,9 +7762,7 @@ function Update-DriverSelectionUI {
             $driverListPanel.Children.Add($noneText) | Out-Null
         }
         else {
-            $suitableToShow = $suitableEntries
-            if ($suitableEntries.Count -gt $maxDriversToDisplay) { $suitableToShow = $suitableEntries | Select-Object -First $maxDriversToDisplay }
-            foreach ($entry in ($suitableToShow | Sort-Object { $_.Driver.Name })) {
+            foreach ($entry in ($suitableEntries | Sort-Object { $_.Driver.Name })) {
                 try {
                     $driverPanel = New-DriverListItem -Driver $entry.Driver -InitiallyChecked
                     $driverListPanel.Children.Add($driverPanel) | Out-Null
@@ -7329,13 +7792,7 @@ function Update-DriverSelectionUI {
             $driverListPanel.Children.Add($noneText2) | Out-Null
         }
         else {
-            $notRecommendedToShow = $notRecommendedEntries
-            $showingLimited = $false
-            if ($notRecommendedEntries.Count -gt $maxDriversToDisplay) {
-                $notRecommendedToShow = $notRecommendedEntries | Select-Object -First $maxDriversToDisplay
-                $showingLimited = $true
-            }
-            foreach ($entry in ($notRecommendedToShow | Sort-Object { $_.Driver.Name })) {
+            foreach ($entry in ($notRecommendedEntries | Sort-Object { $_.Driver.Name })) {
                 try {
                     $driverPanel = New-DriverListItem -Driver $entry.Driver -Note $entry.Reason
                     $driverListPanel.Children.Add($driverPanel) | Out-Null
@@ -7343,15 +7800,6 @@ function Update-DriverSelectionUI {
                 catch {
                     Write-Warning "Failed to create UI item for driver: $($entry.Driver.Name)"
                 }
-            }
-            if ($showingLimited) {
-                $limitWarning = [System.Windows.Controls.TextBlock]::new()
-                $limitWarning.Text = "[!] Showing first $maxDriversToDisplay of $($notRecommendedEntries.Count) not-recommended drivers."
-                $limitWarning.FontStyle = [System.Windows.FontStyles]::Italic
-                $limitWarning.Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(255, 140, 0))
-                $limitWarning.Margin = [System.Windows.Thickness]::new(12, 8, 12, 8)
-                $limitWarning.TextWrapping = [System.Windows.TextWrapping]::Wrap
-                $driverListPanel.Children.Add($limitWarning) | Out-Null
             }
         }
         
@@ -7830,12 +8278,12 @@ Write-Verbose "Enhanced UI management functions with driver management loaded su
 .DESCRIPTION
     This region implements the main workflow control:
     - Comprehensive pre-execution validation
-    - Direct workflow execution (no complex runspaces)
+    - Asynchronous workflow execution with monitored runspaces
     - Real-time progress monitoring and user feedback
     - Robust cancellation and cleanup mechanisms
 #>
 
-# Simplified Start Button Handler - Direct execution instead of complex runspaces
+# Start Button Handler - Asynchronous workflow execution
 $uiElements.StartButton.Add_Click({
         # Prevent multiple simultaneous operations
         if ($script:ApplicationState.IsProcessing()) {
@@ -7846,6 +8294,7 @@ $uiElements.StartButton.Add_Click({
         $workflowStartTime = [DateTime]::Now
 
         try {
+            $applicationState = $script:ApplicationState
             Write-ApplicationLog "User initiated driver injection process" ([LogLevel]::Info)
     
             # Step 1: Comprehensive pre-execution validation
@@ -7908,18 +8357,60 @@ $uiElements.StartButton.Add_Click({
             }
     
             # Step 2: Processing method selection
-            $unsignedDrivers = $selectedDrivers | Where-Object { -not $_.IsSigned() }
-        
-            # Handle unsigned drivers
+            $methodChoice = [System.Windows.MessageBox]::Show(
+                @"
+CHOOSE DRIVER INJECTION METHOD
+
+BATCH-STYLE VALIDATED SET (Recommended for speed):
++ Injects every driver found by the scan in one DISM operation
++ Uses the exact validated driver list; no hidden recursive folder injection
++ Faster than individual processing
+
+INDIVIDUAL SELECTION (Recommended for control):
++ Processes only checked drivers
++ Full control over each driver
++ Better for mixed driver sets
+
+Choose BATCH-STYLE for speed, or INDIVIDUAL for control.
+"@,
+                'Choose Processing Method',
+                [System.Windows.MessageBoxButton]::YesNoCancel,
+                [System.Windows.MessageBoxImage]::Question
+            )
+            if ($methodChoice -eq [System.Windows.MessageBoxResult]::Cancel) { return }
+
+            $useBatchStyle = ($methodChoice -eq [System.Windows.MessageBoxResult]::Yes)
+            $methodName = if ($useBatchStyle) { 'Batch-style validated set' } else { 'Individual selection' }
+            $driversToProcess = if ($useBatchStyle) { @($script:ApplicationState.DiscoveredDrivers) } else { $selectedDrivers }
+            if ($driversToProcess.Count -eq 0) {
+                [System.Windows.MessageBox]::Show('No scanned drivers are available for the selected method.', 'No Drivers', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+                return
+            }
+
+            if ($useBatchStyle) {
+                $notRecommended = @($driversToProcess | Where-Object {
+                    -not (Test-DriverSuitabilityForImage -Driver $_ -ImageType $script:CurrentWimImageType -ImageArchitecture $script:CurrentWimArchitecture).Suitable
+                })
+                if ($notRecommended.Count -gt 0) {
+                    $confirmAll = [System.Windows.MessageBox]::Show(
+                        "Batch mode includes $($notRecommended.Count) driver(s) that are not recommended for this image. Inject them anyway?",
+                        'Not Recommended Drivers',
+                        [System.Windows.MessageBoxButton]::YesNo,
+                        [System.Windows.MessageBoxImage]::Warning
+                    )
+                    if ($confirmAll -eq [System.Windows.MessageBoxResult]::No) { return }
+                }
+            }
+
+            $unsignedDrivers = @($driversToProcess | Where-Object { -not $_.IsSigned() })
             if ($unsignedDrivers.Count -gt 0 -and -not $uiElements.ForceUnsignedCheckBox.IsChecked) {
-                $result = [System.Windows.MessageBox]::Show(
-                    "You have selected $($unsignedDrivers.Count) unsigned drivers, but the 'Force unsigned drivers' option is not enabled.`n`nUnsigned drivers pose security risks. Enable unsigned driver installation?", 
-                    "Unsigned Drivers Detected", 
-                    [System.Windows.MessageBoxButton]::YesNo, 
+                $enableUnsigned = [System.Windows.MessageBox]::Show(
+                    "The operation includes $($unsignedDrivers.Count) unsigned driver(s). Enable forced unsigned installation?",
+                    'Unsigned Drivers Detected',
+                    [System.Windows.MessageBoxButton]::YesNo,
                     [System.Windows.MessageBoxImage]::Warning
                 )
-            
-                if ($result -eq [System.Windows.MessageBoxResult]::Yes) {
+                if ($enableUnsigned -eq [System.Windows.MessageBoxResult]::Yes) {
                     $uiElements.ForceUnsignedCheckBox.IsChecked = $true
                 }
                 else {
@@ -7927,44 +8418,13 @@ $uiElements.StartButton.Add_Click({
                 }
             }
         
-            # Choose processing method
-            $methodChoice = [System.Windows.MessageBox]::Show(
-                @"
-CHOOSE DRIVER INJECTION METHOD
-
-BATCH-STYLE RECURSIVE (Recommended for speed):
-+ Faster processing (like the proven batch approach)
-+ Processes entire driver folder recursively  
-+ Simple and reliable
-* Less granular control over individual drivers
-
-INDIVIDUAL SELECTION (Recommended for control):
-+ Process only your selected drivers
-+ Full control over each driver
-+ Better for mixed driver sets
-* Slower processing time
-
-Choose BATCH-STYLE for speed, or INDIVIDUAL for control.
-"@, 
-                "Choose Processing Method", 
-                [System.Windows.MessageBoxButton]::YesNoCancel, 
-                [System.Windows.MessageBoxImage]::Question
-            )
-        
-            if ($methodChoice -eq [System.Windows.MessageBoxResult]::Cancel) {
-                return
-            }
-        
-            $useBatchStyle = ($methodChoice -eq [System.Windows.MessageBoxResult]::Yes)
-            $methodName = if ($useBatchStyle) { "Batch-style recursive" } else { "Individual selection" }
-        
             # Step 3: Final confirmation
             $confirmResult = [System.Windows.MessageBox]::Show(
                 @"
 READY TO INJECT DRIVERS
 
 WIM File: $([System.IO.Path]::GetFileName($wimValidation.ResolvedPath))
-Selected Drivers: $($selectedDrivers.Count)
+Drivers To Process: $($driversToProcess.Count)
 Mount Directory: $($mountValidation.ResolvedPath)
 Method: $methodName
 Force Unsigned: $($uiElements.ForceUnsignedCheckBox.IsChecked)
@@ -7983,82 +8443,87 @@ Proceed with driver injection?
                 return
             }
     
-            # Step 4: Execute simplified workflow
-            Write-ApplicationLog "Starting simplified driver injection workflow..." ([LogLevel]::Info)
+            # Step 4: Execute the workflow asynchronously
+            Write-ApplicationLog "Starting driver injection workflow..." ([LogLevel]::Info)
             Write-ApplicationLog "Method: $methodName" ([LogLevel]::Info)
     
-            # Update UI state
-            $script:ApplicationState.SetCurrentState([ProcessingState]::Processing)
+            $mountPath = New-ApplicationMountDirectory -ParentPath $mountValidation.ResolvedPath
             $uiElements.StartButton.IsEnabled = $false
-            $uiElements.CancelButton.Content = "Cancel Operation"
+            $uiElements.ScanDriversButton.IsEnabled = $false
+            $uiElements.BrowseDriverButton.IsEnabled = $false
+            $uiElements.InventoryDriversButton.IsEnabled = $false
+            $uiElements.RemoveDriversButton.IsEnabled = $false
+            $uiElements.ExportDriversButton.IsEnabled = $false
+            $uiElements.BrowseWimButton.IsEnabled = $false
+            $uiElements.BrowseMountButton.IsEnabled = $false
+            $uiElements.CancelButton.Content = 'Cancel Operation'
+            $uiElements.CancelButton.IsEnabled = $true
             Update-WorkflowStep -Step ([WorkflowStep]::Process)
     
-            # Execute simplified workflow
-            try {
-                $workflowResult = Invoke-DriverInjectionWorkflow -WimFilePath $wimValidation.ResolvedPath `
-                    -SelectedDrivers $selectedDrivers `
-                    -MountDirectoryPath $mountValidation.ResolvedPath `
-                    -DriverFolderPath $uiElements.DriverFolderTextBox.Text `
-                    -ForceUnsignedDrivers:$uiElements.ForceUnsignedCheckBox.IsChecked `
-                    -UseRecursiveMethod:$useBatchStyle
-            
-                $totalDuration = [DateTime]::Now - $workflowStartTime
-            
-                # Process results
-                if ($workflowResult.Success) {
+            $onCompleted = {
+                param($WorkflowResult)
+                if ($WorkflowResult.SuccessfulIndexes -gt 0) {
+                    $applicationState.InstalledDrivers.Clear()
+                    $applicationState.SetCurrentInventoryIndex(0)
+                    $uiElements.InstalledDriverListPanel.Children.Clear()
+                    Update-InstalledDriverCounts
+                }
+                if ($WorkflowResult.Success) {
                     [System.Windows.MessageBox]::Show(
-                        @"
-DRIVER INJECTION COMPLETED SUCCESSFULLY
-
-$($workflowResult.Message)
-
-DETAILS:
-$($workflowResult.Details)
-
-TOTAL TIME: $([math]::Round($totalDuration.TotalMinutes, 1)) minutes
-
-The Windows image has been successfully updated.
-"@, 
-                        "Success", 
+                        "DRIVER INJECTION COMPLETED SUCCESSFULLY`n`n$($WorkflowResult.Message)`n`n$($WorkflowResult.Details)",
+                        'Success',
                         [System.Windows.MessageBoxButton]::OK, 
                         [System.Windows.MessageBoxImage]::Information
                     )
-                    Write-ApplicationLog "Driver injection completed successfully" ([LogLevel]::Success)
+                    Write-ApplicationLog 'Driver injection completed successfully' ([LogLevel]::Success)
                 }
                 else {
                     [System.Windows.MessageBox]::Show(
-                        @"
-DRIVER INJECTION FAILED
-
-$($workflowResult.ErrorInfo.Message)
-
-$($workflowResult.ErrorInfo.Details)
-
-Check the detailed log for more information.
-"@, 
-                        "Failed", 
+                        "DRIVER INJECTION FAILED`n`n$($WorkflowResult.ErrorInfo.Message)`n`n$($WorkflowResult.ErrorInfo.Details)",
+                        'Failed',
                         [System.Windows.MessageBoxButton]::OK, 
                         [System.Windows.MessageBoxImage]::Error
                     )
-                    Write-ApplicationLog "Driver injection failed: $($workflowResult.ErrorInfo.Message)" ([LogLevel]::Error)
+                    Write-ApplicationLog "Driver injection failed: $($WorkflowResult.ErrorInfo.Message)" ([LogLevel]::Error)
                 }
-            }
-            catch {
-                $errorDuration = [DateTime]::Now - $workflowStartTime
-                [System.Windows.MessageBox]::Show(
-                    "Workflow execution error: $($_.Exception.Message)`n`nDuration: $([math]::Round($errorDuration.TotalMinutes, 1)) minutes", 
-                    "Execution Error", 
-                    [System.Windows.MessageBoxButton]::OK, 
-                    [System.Windows.MessageBoxImage]::Error
-                )
-                Write-ApplicationLog "Workflow execution error: $($_.Exception.Message)" ([LogLevel]::Error)
-            }
-            finally {
-                # Reset UI state
-                $script:ApplicationState.SetCurrentState([ProcessingState]::Idle)
+            }.GetNewClosure()
+
+            $onCancelled = {
+                $applicationState.InstalledDrivers.Clear()
+                $applicationState.SetCurrentInventoryIndex(0)
+                $uiElements.InstalledDriverListPanel.Children.Clear()
+                Update-InstalledDriverCounts
+                Write-ApplicationLog 'Injection cancelled; installed-driver inventory was invalidated.' ([LogLevel]::Warning)
+            }.GetNewClosure()
+
+            $onFinally = {
                 $uiElements.StartButton.IsEnabled = $true
-                $uiElements.CancelButton.Content = "Cancel"
-            }
+                $uiElements.ScanDriversButton.IsEnabled = $true
+                $uiElements.BrowseDriverButton.IsEnabled = $true
+                $uiElements.InventoryDriversButton.IsEnabled = $true
+                $uiElements.RemoveDriversButton.IsEnabled = $true
+                $uiElements.ExportDriversButton.IsEnabled = $true
+                $uiElements.BrowseWimButton.IsEnabled = $true
+                $uiElements.BrowseMountButton.IsEnabled = $true
+                $uiElements.CancelButton.Content = 'Cancel'
+                $uiElements.CancelButton.IsEnabled = $true
+            }.GetNewClosure()
+
+            $null = Start-AsyncPowerShellWorkflow -ScriptPath $PSCommandPath -Workflow {
+                Invoke-DriverInjectionWorkflow -WimFilePath $WimFilePath `
+                    -SelectedDrivers $SelectedDrivers `
+                    -MountDirectoryPath $MountDirectoryPath `
+                    -DriverFolderPath $DriverFolderPath `
+                    -ForceUnsignedDrivers:$ForceUnsignedDrivers `
+                    -UseRecursiveMethod:$UseRecursiveMethod
+            } -Variables @{
+                WimFilePath          = $wimValidation.ResolvedPath
+                SelectedDrivers      = $driversToProcess
+                MountDirectoryPath   = $mountPath
+                DriverFolderPath     = $uiElements.DriverFolderTextBox.Text
+                ForceUnsignedDrivers = [bool]$uiElements.ForceUnsignedCheckBox.IsChecked
+                UseRecursiveMethod   = [bool]$useBatchStyle
+            } -MountPath $mountPath -BusyState 'Processing' -OnCompleted $onCompleted -OnCancelled $onCancelled -OnFinally $onFinally
         }
         catch {
             Write-ApplicationLog "Critical error in start button handler: $($_.Exception.Message)" ([LogLevel]::Error)
@@ -8074,426 +8539,54 @@ Check the detailed log for more information.
         }
     })
 
-# Enhanced Cancel Button Handler with comprehensive operation termination
+# Enhanced Cancel Button Handler
 $uiElements.CancelButton.Add_Click({
         if ($script:ApplicationState.CanCancel()) {
-            # Show detailed cancellation confirmation
-            $result = [System.Windows.MessageBox]::Show(
-                @"
-CANCEL DRIVER INJECTION OPERATION?
-
-This will immediately stop the current driver injection process.
-
-CANCELLATION EFFECTS:
-- Current DISM operations will be terminated
-- Any mounted WIM images will be safely unmounted
-- Temporary files will be cleaned up
-- Progress will be lost and cannot be resumed
-
-SAFETY MEASURES:
-- The original WIM file will remain unchanged
-- No partial modifications will be committed
-- Mount directories will be properly cleaned
-
-The cancellation process may take a few moments to complete safely.
-
-Do you want to cancel the current operation?
-"@, 
-                "Confirm Operation Cancellation", 
+            $confirm = [System.Windows.MessageBox]::Show(
+                'Cancel the current operation? Uncommitted changes will be discarded. Already committed indexes will remain changed.',
+                'Confirm Operation Cancellation',
                 [System.Windows.MessageBoxButton]::YesNo, 
                 [System.Windows.MessageBoxImage]::Warning
             )
     
-            if ($result -eq [System.Windows.MessageBoxResult]::Yes) {
-                try {
-                    Write-ApplicationLog "User initiated operation cancellation..." ([LogLevel]::Warning)
-                    $script:ApplicationState.SetCurrentState([ProcessingState]::Cancelling)
-                    $uiElements.CancelButton.Content = "Cancelling..."
-                    $uiElements.CancelButton.IsEnabled = $false
-                    Update-ApplicationProgress 0.0 "Cancelling operation..."
+            if ($confirm -eq [System.Windows.MessageBoxResult]::Yes) {
+                $script:ApplicationState.SetCurrentState([ProcessingState]::Cancelling)
+                $uiElements.CancelButton.Content = 'Cancelling...'
+                $uiElements.CancelButton.IsEnabled = $false
+                Update-ApplicationProgress 0 'Cancelling operation...'
+                Write-ApplicationLog 'Cancellation requested; the active operation will perform targeted cleanup.' ([LogLevel]::Warning)
             
-                    # Enhanced process termination with timeout handling
-                    $currentProcess = $script:ApplicationState.GetCurrentProcess()
-                    if ($currentProcess) {
-                        try {
-                            if (-not $currentProcess.HasExited) {
-                                Write-ApplicationLog "Terminating active DISM process..." ([LogLevel]::Info)
-                                $currentProcess.Kill()
-                        
-                                # Wait briefly for process termination
-                                if (-not $currentProcess.WaitForExit(5000)) {
-                                    Write-ApplicationLog "DISM process termination timed out" ([LogLevel]::Warning)
-                                }
-                                else {
-                                    Write-ApplicationLog "DISM process terminated successfully" ([LogLevel]::Info)
-                                }
-                            }
-                        }
-                        catch [System.InvalidOperationException] {
-                            Write-Verbose "Process already exited during cancellation"
-                        }
-                        catch {
-                            Write-ApplicationLog "Error terminating DISM process: $($_.Exception.Message)" ([LogLevel]::Warning)
+                $currentProcess = $script:ApplicationState.GetCurrentProcess()
+                if ($null -ne $currentProcess) {
+                    try {
+                        if (-not $currentProcess.HasExited) {
+                            $currentProcess.Kill()
+                            $currentProcess.WaitForExit(5000) | Out-Null
                         }
                     }
-            
-                    # Enhanced cleanup with user choice
-                    $mountDir = $uiElements.MountDirTextBox.Text
-                    if (-not [string]::IsNullOrWhiteSpace($mountDir)) {
-                        $mountValidation = Test-SecurePath -Path $mountDir
-                        if ($mountValidation.IsValid) {
-                            $cleanupChoice = [System.Windows.MessageBox]::Show(
-                                @"
-CLEANUP MOUNTED IMAGES
-
-Do you want to automatically clean up any mounted WIM images and temporary files?
-
-RECOMMENDED (Yes):
-- Safely unmount any mounted WIM images
-- Clean up temporary mount directories
-- Free up disk space and resources
-- Prevent potential mount conflicts
-
-MANUAL CLEANUP (No):
-- Skip automatic cleanup operations
-- You will need to manually unmount images if needed
-- May require manual cleanup later
-
-Note: Cleanup operations are safe and will not affect your original WIM files.
-
-Perform automatic cleanup?
-"@, 
-                                "Cleanup Mounted Images", 
-                                [System.Windows.MessageBoxButton]::YesNo, 
-                                [System.Windows.MessageBoxImage]::Question
-                            )
-                    
-                            if ($cleanupChoice -eq [System.Windows.MessageBoxResult]::Yes) {
-                                Write-ApplicationLog "Starting automatic cleanup of mounted images..." ([LogLevel]::Info)
-                                Start-AsyncCleanup -MountDirectory $mountValidation.ResolvedPath
-                            }
-                            else {
-                                Write-ApplicationLog "User skipped automatic cleanup - manual cleanup may be required" ([LogLevel]::Info)
-                            }
-                        }
+                    catch [System.InvalidOperationException] {
+                        Write-Verbose 'Active DISM process exited during cancellation.'
                     }
-            
-                    # Reset application state
-                    $script:ApplicationState.Reset()
-                    $uiElements.StartButton.IsEnabled = $true
-                    $uiElements.CancelButton.Content = "Cancel"
-                    $uiElements.CancelButton.IsEnabled = $true
-                    Update-ApplicationProgress 0.0 "Operation cancelled by user"
-                    Write-ApplicationLog "Operation cancellation completed successfully" ([LogLevel]::Warning)
-            
-                }
-                catch {
-                    Write-ApplicationLog "Error during operation cancellation: $($_.Exception.Message)" ([LogLevel]::Error)
-            
-                    [System.Windows.MessageBox]::Show(
-                        @"
-CANCELLATION WARNING
-
-Unable to completely cancel the operation: $($_.Exception.Message)
-
-CURRENT STATUS:
-- Some background processes may still be running
-- Manual cleanup may be required
-- Check Task Manager for lingering DISM processes
-
-RECOMMENDED ACTIONS:
-- Wait a few minutes for processes to complete naturally
-- Check Task Manager for any remaining dism.exe processes
-- Manually unmount any mounted images if needed
-- Restart the application if necessary
-
-If you continue to experience issues, consider restarting your computer.
-"@, 
-                        "Cancellation Warning", 
-                        [System.Windows.MessageBoxButton]::OK, 
-                        [System.Windows.MessageBoxImage]::Warning
-                    )
+                    catch {
+                        Write-ApplicationLog "Could not terminate the active DISM process: $($_.Exception.Message)" ([LogLevel]::Error)
+                    }
                 }
             }
-            else {
-                Write-ApplicationLog "User chose not to cancel the operation" ([LogLevel]::Info)
-            }
+            return
         }
-        else {
-            # Handle application exit request
-            $result = [System.Windows.MessageBox]::Show(
-                @"
-EXIT APPLICATION?
 
-Are you sure you want to exit the WIM Driver Studio?
-
-CURRENT STATUS:
-- No operations are currently running
-- All changes have been saved
-- It is safe to exit the application
-
-You can restart the application at any time to perform additional driver injections.
-"@, 
-                "Confirm Application Exit", 
-                [System.Windows.MessageBoxButton]::YesNo, 
-                [System.Windows.MessageBoxImage]::Question
-            )
-    
-            if ($result -eq [System.Windows.MessageBoxResult]::Yes) {
-                Write-ApplicationLog "User requested application exit" ([LogLevel]::Info)
-                $window.Close()
-            }
+        $confirmExit = [System.Windows.MessageBox]::Show(
+            'Exit WIM Driver Studio?',
+            'Confirm Application Exit',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Question
+        )
+        if ($confirmExit -eq [System.Windows.MessageBoxResult]::Yes) {
+            $window.Close()
         }
     })
 
 Write-Verbose "Simplified main process control handlers configured successfully"
-#endregion
-
-#region 16. Enhanced Asynchronous Cleanup Function
-<#
-.SYNOPSIS
-    Provides asynchronous cleanup of mounted WIM images and temporary files.
-    
-.DESCRIPTION
-    This region implements safe, non-blocking cleanup operations:
-    - Asynchronous DISM unmount operations
-    - Global mount point cleanup
-    - Progress monitoring with timeout handling
-    - Comprehensive error handling and reporting
-#>
-
-<#
-.SYNOPSIS
-    Starts asynchronous cleanup of mount directories and DISM operations.
-    
-.DESCRIPTION
-    Performs safe, non-blocking cleanup with:
-    - Background DISM unmount operations
-    - Global mount point cleanup as fallback
-    - Progress monitoring and timeout handling
-    - Comprehensive error reporting
-    - Resource management and disposal
-    
-.PARAMETER MountDirectory
-    Path to the mount directory to clean up
-    
-.OUTPUTS
-    Hashtable containing cleanup operation handles for monitoring
-#>
-function Start-AsyncCleanup {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$MountDirectory
-    )
-    
-    process {
-        try {
-            Write-ApplicationLog "Starting asynchronous cleanup for: $MountDirectory" ([LogLevel]::Info)
-            
-            # Create isolated runspace for cleanup operations
-            $cleanupRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-            $cleanupRunspace.Open()
-            
-            # Set required variables in cleanup runspace
-            $cleanupRunspace.SessionStateProxy.SetVariable("MountDir", $MountDirectory)
-            $cleanupRunspace.SessionStateProxy.SetVariable("DismUnmountCommand", $script:Configuration.DismUnmountImage)
-            $cleanupRunspace.SessionStateProxy.SetVariable("DismDiscardFlag", $script:Configuration.DismDiscardFlag)
-            $cleanupRunspace.SessionStateProxy.SetVariable("DismCleanupCommand", $script:Configuration.DismCleanupMountpoints)
-            $cleanupRunspace.SessionStateProxy.SetVariable("TimeoutMs", $script:Configuration.AsyncCleanupTimeoutMs)
-            
-            # Define comprehensive cleanup script with enhanced error handling
-            $cleanupScript = {
-                try {
-                    Write-Verbose "Starting background cleanup operations"
-                    
-                    # Step 1: Attempt targeted unmount of specific directory
-                    Write-Verbose "Attempting to unmount directory: $MountDir"
-                    
-                    $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
-                    $processInfo.FileName = "dism.exe"
-                    # --- CORRECTED SECTION START ---
-                    # Correctly format the arguments with the /MountDir flag
-                    $processInfo.Arguments = "$DismUnmountCommand /MountDir:`"$MountDir`" $DismDiscardFlag"
-                    # --- CORRECTED SECTION END ---
-                    $processInfo.UseShellExecute = $false
-                    $processInfo.CreateNoWindow = $true
-                    $processInfo.RedirectStandardOutput = $true
-                    $processInfo.RedirectStandardError = $true
-                    $processInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-                    
-                    $unmountSuccess = $false
-                    try {
-                        $process = [System.Diagnostics.Process]::Start($processInfo)
-                        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-                        $stderrTask = $process.StandardError.ReadToEndAsync()
-                        if ($process.WaitForExit($TimeoutMs)) {
-                            $unmountSuccess = ($process.ExitCode -eq 0)
-                            if ($unmountSuccess) {
-                                Write-Verbose "Successfully unmounted directory: $MountDir"
-                            }
-                            else {
-                                Write-Verbose "Unmount failed with exit code: $($process.ExitCode)"
-                                $errorOutput = $stderrTask.Result
-                                if (-not [string]::IsNullOrWhiteSpace($errorOutput)) {
-                                    Write-Verbose "Unmount error output: $errorOutput"
-                                }
-                            }
-                        }
-                        else {
-                            Write-Verbose "Unmount operation timed out"
-                            try { $process.Kill() } catch { }
-                        }
-                        $process.Dispose()
-                    }
-                    catch {
-                        Write-Verbose "Exception during unmount: $($_.Exception.Message)"
-                    }
-                    
-                    # Step 2: Global cleanup attempt if specific unmount failed
-                    if (-not $unmountSuccess) {
-                        Write-Verbose "Attempting global mount point cleanup"
-                        
-                        $processInfo.Arguments = $DismCleanupCommand
-                        try {
-                            $globalProcess = [System.Diagnostics.Process]::Start($processInfo)
-                            $globalStdoutTask = $globalProcess.StandardOutput.ReadToEndAsync()
-                            $globalStderrTask = $globalProcess.StandardError.ReadToEndAsync()
-                            if ($globalProcess.WaitForExit($TimeoutMs)) {
-                                $globalSuccess = ($globalProcess.ExitCode -eq 0)
-                                if ($globalSuccess) {
-                                    Write-Verbose "Global cleanup completed successfully"
-                                }
-                                else {
-                                    Write-Verbose "Global cleanup failed with exit code: $($globalProcess.ExitCode)"
-                                }
-                                $globalProcess.Dispose()
-                                
-                                return @{ 
-                                    Success = $globalSuccess
-                                    Message = if ($globalSuccess) { "Global cleanup successful" } else { "Global cleanup failed - manual cleanup may be required" }
-                                    Method  = "Global"
-                                }
-                            }
-                            else {
-                                Write-Verbose "Global cleanup operation timed out"
-                                try { $globalProcess.Kill() } catch { }
-                                $globalProcess.Dispose()
-                            }
-                        }
-                        catch {
-                            Write-Verbose "Exception during global cleanup: $($_.Exception.Message)"
-                        }
-                        
-                        return @{ 
-                            Success = $false
-                            Message = "Both targeted and global cleanup operations failed or timed out"
-                            Method  = "Failed"
-                        }
-                    }
-                    else {
-                        return @{ 
-                            Success = $true
-                            Message = "Targeted directory unmount successful"
-                            Method  = "Targeted"
-                        }
-                    }
-                }
-                catch {
-                    Write-Verbose "Critical error during cleanup: $($_.Exception.Message)"
-                    return @{ 
-                        Success = $false
-                        Message = "Critical cleanup error: $($_.Exception.Message)"
-                        Method  = "Error"
-                    }
-                }
-            }
-            
-            # Create PowerShell instance for cleanup execution
-            $cleanupPowerShell = [System.Management.Automation.PowerShell]::Create()
-            $cleanupPowerShell.Runspace = $cleanupRunspace
-            $cleanupPowerShell.AddScript($cleanupScript)
-            
-            # Start cleanup operation and get async result
-            $cleanupResult = $cleanupPowerShell.BeginInvoke()
-            
-            # Create timer for monitoring cleanup completion
-            $cleanupTimer = [System.Windows.Threading.DispatcherTimer]::new()
-            $cleanupTimer.Interval = [TimeSpan]::FromMilliseconds($script:Configuration.CleanupMonitorIntervalMs)
-            
-            $cleanupTimer.Add_Tick({
-                    if ($cleanupResult.IsCompleted) {
-                        $cleanupTimer.Stop()
-                    
-                        try {
-                            $result = $cleanupPowerShell.EndInvoke($cleanupResult)
-                        
-                            if ($result.Success) {
-                                Write-ApplicationLog "Async cleanup completed successfully: $($result.Message) (Method: $($result.Method))" ([LogLevel]::Success)
-                            }
-                            else {
-                                Write-ApplicationLog "Async cleanup completed with warnings: $($result.Message)" ([LogLevel]::Warning)
-                            }
-                        }
-                        catch {
-                            Write-ApplicationLog "Async cleanup exception: $($_.Exception.Message)" ([LogLevel]::Warning)
-                        }
-                        finally {
-                            # Comprehensive resource cleanup
-                            try {
-                                $cleanupPowerShell.Dispose()
-                            }
-                            catch { 
-                                Write-Verbose "PowerShell disposal warning during cleanup: $($_.Exception.Message)"
-                            }
-                        
-                            try {
-                                $cleanupRunspace.Close()
-                                $cleanupRunspace.Dispose()
-                            }
-                            catch { 
-                                Write-Verbose "Runspace disposal warning during cleanup: $($_.Exception.Message)"
-                            }
-                        }
-                    }
-                })
-            
-            # Start monitoring timer
-            $cleanupTimer.Start()
-            
-            Write-ApplicationLog "Asynchronous cleanup initiated with timeout of $($script:Configuration.AsyncCleanupTimeoutMs / 1000) seconds" ([LogLevel]::Info)
-            
-            # Return operation handles for external monitoring if needed
-            return @{
-                PowerShell = $cleanupPowerShell
-                Runspace   = $cleanupRunspace
-                Timer      = $cleanupTimer
-                Result     = $cleanupResult
-            }
-        }
-        catch {
-            Write-ApplicationLog "Failed to start asynchronous cleanup: $($_.Exception.Message)" ([LogLevel]::Warning)
-            
-            # Cleanup any partially created resources
-            if ($cleanupPowerShell) {
-                try { $cleanupPowerShell.Dispose() } 
-                catch { Write-Verbose "PowerShell disposal error: $($_.Exception.Message)" }
-            }
-            if ($cleanupRunspace) {
-                try { 
-                    $cleanupRunspace.Close()
-                    $cleanupRunspace.Dispose() 
-                } 
-                catch { Write-Verbose "Runspace disposal error: $($_.Exception.Message)" }
-            }
-            
-            return $null
-        }
-    }
-}
-
-Write-Verbose "Enhanced asynchronous cleanup function loaded successfully"
 #endregion
 
 #region 17. Enhanced Window Lifecycle Management
@@ -8509,175 +8602,85 @@ Write-Verbose "Enhanced asynchronous cleanup function loaded successfully"
     - Comprehensive resource cleanup and memory management
 #>
 
-# Enhanced Window Closing Handler with comprehensive cleanup and user protection
+# Enhanced Window Closing Handler
 $window.Add_Closing({
         param($windowSender, $cancelEventArgs)
     
         try {
-            Write-ApplicationLog "Application shutdown initiated" ([LogLevel]::Info)
-        
-            # Check if critical operations are in progress
+            Write-ApplicationLog 'Application shutdown initiated.' ([LogLevel]::Info)
             if ($script:ApplicationState.IsProcessing()) {
-                Write-ApplicationLog "Active operation detected during shutdown request" ([LogLevel]::Warning)
-            
-                $result = [System.Windows.MessageBox]::Show(
-                    @"
-ACTIVE OPERATION IN PROGRESS
-
-A driver injection process is currently running. Closing the application now may result in:
-
-POTENTIAL ISSUES:
-- Mounted WIM images left in inconsistent state
-- Temporary files not properly cleaned up
-- Background DISM processes continuing to run
-- Potential system instability or resource leaks
-- Loss of current operation progress
-
-RECOMMENDED ACTION:
-Cancel the current operation first using the 'Cancel Operation' button, then exit the application safely.
-
-ALTERNATIVE ACTIONS:
-- Wait for the current operation to complete naturally
-- Use Task Manager to monitor and terminate processes if needed
-
-Force close anyway? (NOT RECOMMENDED)
-This will attempt emergency cleanup but may not be completely safe.
-"@, 
-                    "Active Operation - Unsafe Shutdown", 
+                $forceClose = [System.Windows.MessageBox]::Show(
+                    'An operation is still running. Force close now? Uncommitted changes will be discarded; already committed indexes remain changed.',
+                    'Active Operation',
                     [System.Windows.MessageBoxButton]::YesNo, 
                     [System.Windows.MessageBoxImage]::Warning
                 )
-            
-                if ($result -eq [System.Windows.MessageBoxResult]::No) {
-                    Write-ApplicationLog "User cancelled shutdown to avoid interrupting active operation" ([LogLevel]::Info)
+                if ($forceClose -eq [System.Windows.MessageBoxResult]::No) {
                     $cancelEventArgs.Cancel = $true
                     return
                 }
             
-                Write-ApplicationLog "User confirmed force shutdown despite active operation" ([LogLevel]::Warning)
-            
-                # Enhanced emergency cleanup with comprehensive resource termination
-                try {
-                    Write-ApplicationLog "Performing emergency cleanup during forced shutdown..." ([LogLevel]::Warning)
-                    Update-ApplicationProgress 0.0 "Emergency shutdown in progress..."
-                
-                    # Terminate active DISM processes
-                    $currentProcess = $script:ApplicationState.GetCurrentProcess()
-                    if ($currentProcess -and -not $currentProcess.HasExited) {
-                        Write-ApplicationLog "Emergency termination of DISM process" ([LogLevel]::Warning)
+                $script:ApplicationState.SetCurrentState([ProcessingState]::Cancelling)
+                $activeProcesses = $script:ApplicationState.GetActiveProcesses()
+                if ($null -ne $activeProcesses) {
+                    foreach ($activeProcess in @($activeProcesses.Values)) {
                         try {
-                            $currentProcess.Kill()
-                            $currentProcess.WaitForExit(5000)  # Wait up to 5 seconds
-                        }
-                        catch {
-                            Write-ApplicationLog "Error terminating DISM process: $($_.Exception.Message)" ([LogLevel]::Error)
-                        }
-                    }
-                
-                    # Stop PowerShell execution
-                    $currentPowerShell = $script:ApplicationState.GetCurrentPowerShell()
-                    if ($currentPowerShell) {
-                        Write-ApplicationLog "Emergency termination of PowerShell execution" ([LogLevel]::Warning)
-                        try {
-                            $currentPowerShell.Stop()
-                        }
-                        catch {
-                            Write-ApplicationLog "Error stopping PowerShell execution: $($_.Exception.Message)" ([LogLevel]::Error)
-                        }
-                    }
-                
-                    # Attempt emergency mount cleanup
-                    $mountDir = $uiElements.MountDirTextBox.Text
-                    if (-not [string]::IsNullOrWhiteSpace($mountDir)) {
-                        $mountValidation = Test-SecurePath -Path $mountDir
-                        if ($mountValidation.IsValid) {
-                            Write-ApplicationLog "Attempting emergency mount directory cleanup" ([LogLevel]::Info)
-                            try {
-                                # Quick cleanup attempt without waiting for completion
-                                Start-AsyncCleanup -MountDirectory $mountValidation.ResolvedPath | Out-Null
-                            }
-                            catch {
-                                Write-ApplicationLog "Emergency mount cleanup failed: $($_.Exception.Message)" ([LogLevel]::Warning)
+                            if (-not $activeProcess.HasExited) {
+                                $activeProcess.Kill()
+                                $activeProcess.WaitForExit(5000) | Out-Null
                             }
                         }
+                        catch { }
                     }
-                
-                    Write-ApplicationLog "Emergency cleanup completed - some manual cleanup may still be required" ([LogLevel]::Warning)
                 }
-                catch {
-                    Write-ApplicationLog "Emergency cleanup failed: $($_.Exception.Message)" ([LogLevel]::Error)
-                
-                    # Show warning about potential system issues
-                    [System.Windows.MessageBox]::Show(
-                        @"
-EMERGENCY CLEANUP WARNING
-
-Unable to complete emergency cleanup: $($_.Exception.Message)
-
-MANUAL CLEANUP MAY BE REQUIRED:
-- Check Task Manager for lingering dism.exe processes
-- Manually unmount any mounted WIM images using DISM
-- Clean up temporary mount directories
-- Run 'dism /cleanup-mountpoints' as administrator
-
-COMMANDS FOR MANUAL CLEANUP:
-1. Open Command Prompt as Administrator
-2. Run: dism /cleanup-mountpoints
-3. Check mount directory: $mountDir
-4. Remove any remaining temporary files
-
-Monitor system performance and restart if necessary.
-"@, 
-                        "Emergency Cleanup Warning", 
-                        [System.Windows.MessageBoxButton]::OK, 
-                        [System.Windows.MessageBoxImage]::Warning
-                    )
-                }
-            }
-        
-            # Enhanced normal shutdown procedure
-            try {
-                Write-ApplicationLog "Performing normal application shutdown..." ([LogLevel]::Info)
             
-                # Reset application state and clear references
+                $currentPowerShell = $script:ApplicationState.GetCurrentPowerShell()
+                if ($null -ne $currentPowerShell) {
+                    try { $currentPowerShell.Stop() } catch { }
+                }
+                $backgroundResult = $script:ApplicationState.GetBackgroundResult()
+                if ($null -ne $backgroundResult) {
+                    try { $backgroundResult.AsyncWaitHandle.WaitOne(10000) | Out-Null } catch { }
+                }
+            
+                $mountPath = $script:ApplicationState.GetCurrentMountPath()
+                $cleanupSucceeded = Complete-OperationJournal -MountPath $mountPath
+            
+                if ($null -ne $currentPowerShell) {
+                    try { $currentPowerShell.Dispose() } catch { }
+                }
+                $currentRunspace = $script:ApplicationState.GetCurrentRunspace()
+                if ($null -ne $currentRunspace) {
+                    try { $currentRunspace.Close(); $currentRunspace.Dispose() } catch { }
+                }
                 $script:ApplicationState.Reset()
-            
-                # Unregister any remaining event subscriptions
-                $eventSub = $script:ApplicationState.GetEventSubscription()
-                if ($eventSub) {
-                    try {
-                        Unregister-Event -SubscriptionId $eventSub.Id -Force -ErrorAction SilentlyContinue
-                        Write-ApplicationLog "Event subscriptions cleaned up" ([LogLevel]::Info)
-                    }
-                    catch {
-                        Write-Verbose "Event subscription cleanup warning: $($_.Exception.Message)"
-                    }
+
+                if (-not $cleanupSucceeded) {
+                    $cancelEventArgs.Cancel = $true
+                    [System.Windows.MessageBox]::Show(
+                        'The application could not discard the active mount. Close was cancelled; use an elevated command prompt to unmount the image manually.',
+                        'Cleanup Failed',
+                        [System.Windows.MessageBoxButton]::OK,
+                        [System.Windows.MessageBoxImage]::Error
+                    )
+                    return
                 }
-            
-                # Clear UI references to prevent memory leaks
-                $script:MainWindow = $null
-            
-                # Force garbage collection for clean shutdown
-                [System.GC]::Collect()
-                [System.GC]::WaitForPendingFinalizers()
-                [System.GC]::Collect()
-            
-                Write-ApplicationLog "Application shutdown completed successfully" ([LogLevel]::Info)
             }
-            catch {
-                Write-ApplicationLog "Error during normal shutdown: $($_.Exception.Message)" ([LogLevel]::Warning)
+            else {
+                $script:ApplicationState.Reset()
             }
+
+            Write-ApplicationLog 'Application shutdown completed.' ([LogLevel]::Info)
         }
         catch {
-            Write-ApplicationLog "Critical error during application shutdown: $($_.Exception.Message)" ([LogLevel]::Error)
-        
-            # Ensure shutdown continues even on critical errors
-            try {
-                $script:ApplicationState.Reset()
-                $script:MainWindow = $null
-                [System.GC]::Collect()
-            }
-            catch { }
+            $cancelEventArgs.Cancel = $true
+            Write-ApplicationLog "Shutdown cleanup failed: $($_.Exception.Message)" ([LogLevel]::Error)
+            [System.Windows.MessageBox]::Show(
+                "Shutdown was cancelled because cleanup failed: $($_.Exception.Message)",
+                'Shutdown Error',
+                [System.Windows.MessageBoxButton]::OK,
+                [System.Windows.MessageBoxImage]::Error
+            )
         }
     })
 
@@ -8701,7 +8704,7 @@ Write-Verbose "Enhanced window lifecycle management configured successfully"
 
 try {
     Write-ApplicationLog "WIM Driver Studio starting..." ([LogLevel]::Info)
-    Write-ApplicationLog "Enhanced features: Thread-safe operations, optimized parallel processing, Windows 11 Fluent Design, comprehensive security validation" ([LogLevel]::Info)
+    Write-ApplicationLog "Enhanced features: Thread-safe asynchronous operations, Windows 11 Fluent Design, comprehensive security validation" ([LogLevel]::Info)
     Write-ApplicationLog "PowerShell version: $($PSVersionTable.PSVersion)" ([LogLevel]::Info)
     Write-ApplicationLog "Operating system: $([System.Environment]::OSVersion.VersionString)" ([LogLevel]::Info)
     Write-ApplicationLog "Processor count: $([System.Environment]::ProcessorCount)" ([LogLevel]::Info)
@@ -8712,12 +8715,36 @@ try {
     $adminCheck = Test-EnhancedAdministratorPrivileges
     $dismCheck = Test-DismToolAvailability
     
+    $staleOperation = Get-StaleOperationJournal
+    if ($null -ne $staleOperation) {
+        $recover = [System.Windows.MessageBox]::Show(
+            "A previous operation was interrupted.`nMount directory: $($staleOperation.MountPath)`n`nAttempt targeted discard and cleanup now?",
+            'Recover Interrupted Operation',
+            [System.Windows.MessageBoxButton]::YesNo,
+            [System.Windows.MessageBoxImage]::Warning
+        )
+        if ($recover -eq [System.Windows.MessageBoxResult]::Yes -and (Test-ApplicationMountDirectory -MountPath $staleOperation.MountPath)) {
+            if (Complete-OperationJournal -MountPath $staleOperation.MountPath) {
+                Write-ApplicationLog 'Interrupted operation mount was discarded and cleaned.' ([LogLevel]::Success)
+            }
+            else {
+                Write-ApplicationLog 'Targeted recovery failed; manual mount cleanup is required.' ([LogLevel]::Error)
+            }
+        }
+        else {
+            Write-ApplicationLog 'Interrupted operation recovery was skipped or the mount path is not application-owned.' ([LogLevel]::Warning)
+        }
+    }
+
     # Step 2: Update security status with detailed messaging and user guidance
     if (-not $adminCheck) {
         Write-ApplicationLog "Administrator privileges not available - running in demonstration mode" ([LogLevel]::Warning)
         
         # Update UI to reflect demonstration mode
         $uiElements.StartButton.IsEnabled = $false
+        $uiElements.InventoryDriversButton.IsEnabled = $false
+        $uiElements.RemoveDriversButton.IsEnabled = $false
+        $uiElements.ExportDriversButton.IsEnabled = $false
         $uiElements.StartButton.ToolTip = "Administrator privileges required - restart as administrator to enable driver injection"
         $uiElements.SecurityStatusBlock.Text = "[!] Administrator privileges required"
         $uiElements.SecurityStatusBlock.Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(196, 43, 28))
@@ -8775,6 +8802,9 @@ The application will continue in demonstration mode for evaluation purposes.
         
         # Disable functionality that requires DISM
         $uiElements.StartButton.IsEnabled = $false
+        $uiElements.InventoryDriversButton.IsEnabled = $false
+        $uiElements.RemoveDriversButton.IsEnabled = $false
+        $uiElements.ExportDriversButton.IsEnabled = $false
         $uiElements.StartButton.ToolTip = "DISM tool not available - install Windows ADK to enable driver injection"
         
         # Show comprehensive DISM installation guidance
@@ -8853,7 +8883,7 @@ The application will run in limited demonstration mode without DISM functionalit
     Write-ApplicationLog "Thread-safe state management initialized" ([LogLevel]::Info)
     Write-ApplicationLog "Windows 11 Fluent Design interface ready" ([LogLevel]::Info)
     Write-ApplicationLog "Security validation completed" ([LogLevel]::Info)
-    Write-ApplicationLog "Performance optimization enabled (parallel processing: $($script:Configuration.MaxParallelThreads) threads)" ([LogLevel]::Info)
+    Write-ApplicationLog "Asynchronous workflow monitoring enabled" ([LogLevel]::Info)
     Write-ApplicationLog "Application ready for user interaction" ([LogLevel]::Success)
     
     # Step 7: Show the main window with enhanced error handling
